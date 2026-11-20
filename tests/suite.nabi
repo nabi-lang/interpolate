@@ -1,0 +1,67 @@
+// Tests: exact reproduction of polynomials up to each method's order,
+// closed forms and textbook values, shape properties (monotone PCHIP,
+// empty circumcircles), brute-force cross-checks on seeded random data,
+// quadrature against known integrals within the reported error, and
+// edge cases.
+
+mod diff;
+mod grid;
+mod oned;
+#[cfg(feature = "ops")]
+mod ops;
+mod poly;
+mod quad;
+mod scatter;
+mod smooth;
+mod spline;
+
+use core::array::{Array, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+pub fn expect(ok: bool, what: str) {
+    if !ok { panic(f"check failed: {what}"); }
+}
+
+/// `|a - b| <= tol`.
+pub fn close(a: f64, b: f64, tol: f64, what: str) {
+    if !((a - b).abs() <= tol) { panic(f"check failed: {what}: {a} vs {b} (tol {tol})"); }
+}
+
+/// `|a - b| <= tol * max(1, |b|)`.
+pub fn rel(a: f64, b: f64, tol: f64, what: str) {
+    if !((a - b).abs() <= tol * b.abs().max(1.0)) { panic(f"check failed: {what}: {a} vs {b} (rel tol {tol})"); }
+}
+
+/// `n` uniform values in [lo, hi).
+pub fn uniform(n: usize, lo: f64, hi: f64, seed: u64) -> Vector<f64> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(n);
+    for _ in 0..n { xs.push(g.uniform(lo, hi)); }
+    Array::from_list(xs, [n])
+}
+
+/// `n` sorted, strictly rising values in [lo, hi).
+pub fn sorted(n: usize, lo: f64, hi: f64, seed: u64) -> Vector<f64> {
+    let xs = uniform(n, lo, hi, seed).to_list();
+    xs.sort_by(|a: f64, b: f64| a.total_cmp(b));
+    Array::from_list(xs, [n])
+}
+
+/// `n` evenly spaced values from `a` to `b`.
+pub fn linspace(a: f64, b: f64, n: usize) -> Vector<f64> { Array::from(num::linspace(a, b, n)) }
+
+/// Whether `f` throws an `InterpError` whose variant is `want`.
+pub fn throws_kind(f: fn() throws (pkg::InterpError), want: str) -> bool {
+    try { f(); false } catch e: pkg::InterpError {
+        let k = match e {
+            pkg::InterpError::TooFewPoints { .. } => "TooFewPoints",
+            pkg::InterpError::NotSorted { .. } => "NotSorted",
+            pkg::InterpError::LengthMismatch { .. } => "LengthMismatch",
+            pkg::InterpError::NotFinite { .. } => "NotFinite",
+            pkg::InterpError::BadArgument { .. } => "BadArgument",
+            pkg::InterpError::Singular { .. } => "Singular",
+            pkg::InterpError::NoConvergence { .. } => "NoConvergence",
+        };
+        k == want
+    }
+}

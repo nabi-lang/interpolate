@@ -1,0 +1,111 @@
+use pkg::ops::{Approx, ∂, ∇, ∫};
+use pkg::tests::suite::{close, expect, linspace, sorted};
+use pkg::{Curve, Polynomial};
+use core::array::{Array, Matrix, Vector};
+use linalg::ops::Kron;
+
+#[test]
+fn calculus_names() {
+    let x = sorted(12, 0.0, 2.0, 1);
+    let s = try! pkg::cubic_spline(x, x.map(|t: f64| -> f64 { t ** 3 }));
+    close(∂(s).at(1.0), 3.0, 1e-11, "∂ spline");
+    close(∂(s, 3).at(1.0), 6.0, 1e-8, "∂ third");
+    let b = try! pkg::make_interp_spline(x, x.map(|t: f64| -> f64 { t ** 3 }));
+    close(∂(∂(b)).at(1.5), 9.0, 1e-9, "∂∂ bspline");
+    let p = Polynomial::new([1, 2, 3]);
+    expect(∂(p) == Polynomial::new([2, 6]) && ∂(p, 2) == Polynomial::new([6]), "∂ polynomial");
+    let c = pkg::Chebyshev::interpolate(f64::exp, 20, -1.0..1.0);
+    close(∂(c).at(0.5), 0.5.exp(), 1e-13, "∂ chebyshev");
+    close(try! ∫(f64::cos, 0.0..f64::PI / 2.0), 1.0, 1e-15, "∫ cos");
+    close(try! ∫(|t: f64| -> f64 { 1.0 / t.sqrt() }, 0.0..1.0), 2.0, 1e-12, "∫ endpoint singularity");
+    close(try! ∫(|t: f64| -> f64 { 1.0 / (1.0 + t * t) }, -f64::INFINITY..f64::INFINITY), f64::PI, 1e-12, "∫ over R");
+    // ∫ of an interpolant is its exact integral; of its func, quad.
+    expect(try! ∫(s, 0.5..1.5) == s.integrate(0.5..1.5), "∫ s");
+    close(try! ∫(s.func(), 0.5..1.5), s.integrate(0.5..1.5), 1e-12, "∫ s.func()");
+    let w = 3.0;
+    close(try! ∫(|t: f64| -> f64 { w * t }, 0.0..2.0), 6.0, 1e-15, "∫ of a capturing closure");
+    close(try! ∫(|t| t * t, 0.0..3.0), 9.0, 1e-14, "∫ of an untyped closure");
+    let l = try! pkg::linear([0, 1, 2], [0, 1, 0]);
+    expect(try! ∫(l, 0.0..2.0) == 1.0, "∫ Linear");
+    close(try! ∫(try! pkg::nearest([0, 1, 2], [0, 1, 0]), 0.0..2.0), 1.0, 1e-12, "∫ Step");
+    let y: Vector<f64> = [1, 4, 9, 16, 25];
+    expect(∇(y) == Vector::<f64>::from([3.0, 4.0, 6.0, 8.0, 9.0]), "∇ rank 1");
+    let one: Vector<f64> = [2.0];
+    expect(∇(one) == Vector::<f64>::from([0.0]), "∇ of one sample");
+    let a = Array::from_fn([3, 3, 3], |i: [usize; 3]| -> f64 { (i[0] + 2 * i[1] + 3 * i[2]) as f64 });
+    let g = ∇(a);
+    expect(g.len() == 3 && g[2][1, 1, 1] == 3.0 && g[1][0, 2, 2] == 2.0, "∇ rank 3");
+}
+
+#[test]
+fn with_optimize_notation() {
+    // interpolate's and autodiff's (optimize's) `∂` / `∇` are one item.
+    let fp = ∂(|x: autodiff::Dual| -> autodiff::Dual { x * x });
+    close(fp(3.0), 6.0, 0.0, "∂ of a function");
+    let g = ∇(|x: Vector<autodiff::Var>| -> autodiff::Var { x[0] * x[1] });
+    expect(g([2.0, 5.0]) == Vector::<f64>::from([5.0, 2.0]), "∇ of a function");
+}
+
+#[test]
+fn approx_operator() {
+    // Binds like `==`: arithmetic on both sides first.
+    expect(0.1 + 0.2 ≈ 0.3, "0.1 + 0.2");
+    expect(1.0 / 3.0 * 3.0 ≈ 1.0, "1/3 * 3");
+    expect(!(1.0 ≈ 1.0 + 1e-6), "not close");
+    expect(1e20 ≈ 1e20 * (1.0 + 1e-12), "relative");
+    expect(1e-20 ≈ 0.0, "absolute near zero");
+    expect(f64::INFINITY ≈ f64::INFINITY, "inf");
+    expect(!(f64::NAN ≈ f64::NAN), "nan");
+    let x = linspace(0.0, 1.0, 11);
+    let s = try! pkg::cubic_spline(x, x .* x);
+    expect(s.eval(x) ≈ x .* x, "arrays");
+    let m: Matrix<f64> = [[1, 2], [3, 4]];
+    expect(!(m ≈ m .+ 1e-3), "matrix differs");
+    expect(!(x ≈ linspace(0.0, 1.0, 10)), "shapes differ");
+    expect(1.0.close(1.05, 0.1), "named form");
+}
+
+#[test]
+fn tensor_product_operator() {
+    let x = linspace(0.0, 3.0, 7);
+    let a = try! pkg::make_interp_spline(x, x.map(|t: f64| -> f64 { t * t }));
+    let b = try! pkg::make_interp_spline(x, x.map(|t: f64| -> f64 { 1.0 - t }));
+    let s = a ⊗ b;
+    for u in linspace(0.0, 3.0, 5) {
+        for v in linspace(0.0, 3.0, 5) { close(s.at([u, v]), u * u * (1.0 - v), 1e-11, "a(x) b(y)"); }
+    }
+    close(s.integrate([0.0..3.0, 0.0..1.0]), 9.0 * 0.5, 1e-11, "separable integral");
+    // Shares linalg's token: matrices still take `⊗`.
+    let i: Matrix<f64> = linalg::eye(2);
+    expect((i ⊗ i).shape() == [4, 4], "kron");
+}
+
+#[test]
+fn interpolants_are_callable() {
+    let x: Vector<f64> = [0, 1, 2, 3];
+    let y: Vector<f64> = [0, 1, 8, 27];
+    let s = try! pkg::cubic_spline(x, y);
+    let xs: Vector<f64> = [0.25, 1.5, 2.75];
+    expect(s(1.5) == s.at(1.5), "s(x)");
+    expect(s(xs) == s.eval(xs) && (xs |> s) == s.eval(xs) && s.(xs) == s.eval(xs), "s(xs), xs |> s, s.(xs)");
+    let m: Matrix<f64> = [[0.5, 1.0], [2.0, 2.5]];
+    let sm = s(m);
+    expect(sm.shape() == [2, 2] && sm[1, 0] == s(2.0), "s of a matrix");
+    let c3: Array<f64, 3> = Array::from_fn([2, 1, 2], |i: [usize; 3]| -> f64 { (i[0] + i[2]) as f64 });
+    let s3 = s(c3);
+    expect(s3.shape() == [2, 1, 2] && s3[1, 0, 1] == s(2.0), "s of a rank-3 array");
+    expect(s([0.25, 1.5, 2.75]) == s(xs) && s(2) == s(2.0), "list and int literals");
+    let l = try! pkg::linear(x, y);
+    let b = try! pkg::make_interp_spline(x, y);
+    let bc = try! pkg::barycentric(x, y);
+    let st = try! pkg::previous(x, y);
+    let p = Polynomial::new([1, 2]);
+    let c = pkg::Chebyshev::interpolate(f64::exp, 20, -1.0..1.0);
+    expect(l(0.5) == 0.5 && st(1.5) == 1.0 && p(2.0) == 5.0, "linear, step, polynomial");
+    close(b(1.5), s(1.5), 1e-12, "bspline");
+    close(bc(2.0), 8.0, 1e-12, "barycentric");
+    close(c(0.5), 0.5.exp(), 1e-13, "chebyshev");
+    expect(l.ppoly()(1.5) == l(1.5), "a call on a call's result");
+    let g = try! pkg::grid([x, x], Array::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] + 2 * i[1]) as f64 }), pkg::GridMethod::Linear);
+    expect(g([1.5, 0.5]) == 2.5, "grid at a point");
+}

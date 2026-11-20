@@ -1,0 +1,57 @@
+// The one error type of the package. Each message says what went wrong
+// and what to write instead.
+
+/// What went wrong building or evaluating an interpolant, a fit or an
+/// integral.
+///
+/// ```nabi
+/// use interpolate::InterpError;
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0, 2, 1];
+/// let y: Vector<f64> = [0, 1, 2];
+/// let e = try {
+///     _ = try interpolate::linear(x, y);
+///     InterpError::NotFinite { what: "" }
+/// } catch e: InterpError { e };
+/// assert(e == InterpError::NotSorted { at: 2 });
+/// assert(f"{e}".contains("sort"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum InterpError {
+    /// The method needs at least `need` points and got `got`.
+    TooFewPoints { need: usize; got: usize; },
+    /// The sample positions must rise strictly; `at` is the first index
+    /// that does not.
+    NotSorted { at: usize; },
+    /// Two inputs that must agree in length or shape do not; `what`
+    /// names both.
+    LengthMismatch { what: str; },
+    /// An input holds NaN or an infinity; `what` names it.
+    NotFinite { what: str; },
+    /// An argument is out of its range; `what` says which and what fits.
+    BadArgument { what: str; },
+    /// A linear system of the method is singular (repeated points, or a
+    /// degenerate configuration); `what` names it.
+    Singular { what: str; },
+    /// An iteration stopped after `iterations` steps short of the
+    /// tolerance; `value` and `error` are the best estimate so far.
+    NoConvergence { iterations: usize; value: f64; error: f64; },
+}
+
+impl Display for InterpError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            InterpError::TooFewPoints { need, got } => f"needs at least {need} points, got {got}; pass more samples or pick a lower-order method (`linear` needs 2)",
+            InterpError::NotSorted { at } => f"sample positions must rise strictly, but x[{at}] <= x[{at - 1}]; sort the pairs by x first and merge repeated x (average their y)",
+            InterpError::LengthMismatch { what } => f"lengths do not fit: {what}",
+            InterpError::NotFinite { what } => f"{what} holds NaN or infinity; drop or replace those samples first",
+            InterpError::BadArgument { what } => what,
+            InterpError::Singular { what } => f"singular system: {what}",
+            InterpError::NoConvergence { iterations, value, error } => f"no convergence after {iterations} steps (best estimate {value}, error {error}); raise the limit, loosen the tolerance or split the range at the trouble spot",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for InterpError {}

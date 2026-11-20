@@ -1,0 +1,87 @@
+// Polynomial interpolation in barycentric form (Berrut and Trefethen,
+// "Barycentric Lagrange Interpolation", SIAM Review 2004): O(n^2) to
+// build, O(n) per point, and backward stable for any node set (the
+// second, "true" form), so Chebyshev-like nodes reach machine precision.
+
+use pkg::data::pairs;
+use pkg::{Curve, InterpError};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+/// The polynomial of degree `n - 1` through `n` samples, in barycentric
+/// form. Exact (to rounding) for polynomials of degree `< n`; on
+/// equispaced nodes it suffers Runge's phenomenon, so prefer Chebyshev
+/// nodes or a spline for many points. Outside the nodes it is the same
+/// polynomial (no extrapolation modes).
+///
+/// ```nabi
+/// use interpolate::Curve;
+///
+/// let p = try interpolate::barycentric([0, 1, 2, 3], [1, 2, 5, 10]);    // x^2 + 1
+/// assert((p.at(1.5) - 3.25).abs() < 1e-14 && (p.at(4.0) - 17.0).abs() < 1e-12);
+/// ```
+#[derive(Clone)]
+pub struct Barycentric {
+    x: List<f64>;
+    y: List<f64>;
+    w: List<f64>;
+}
+
+/// The barycentric interpolant through `(x[i], y[i])` (at least 1
+/// point, `x` rising strictly). The weights are scaled by the capacity
+/// `4 / (x[n - 1] - x[0])` per factor so they neither overflow nor
+/// underflow for large `n`.
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use core::array::Vector;
+///
+/// // 21 Chebyshev points of the second kind on [-1, 1].
+/// let x = Vector::<f64>::from_fn([21], |i: [usize; 1]| -> f64 { -(f64::PI * (i[0] as f64) / 20.0).cos() });
+/// let y = f64::exp.(x);
+/// let p = try interpolate::barycentric(x, y);
+/// assert((p.at(0.3) - 0.3.exp()).abs() < 1e-15);
+/// ```
+pub fn barycentric<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y) throws (InterpError) -> Barycentric {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let (xs, ys) = try pairs(x, y, 1);
+    let n = xs.len();
+    let span = xs[n - 1] - xs[0];
+    let cap = if span > 0.0 { 4.0 / span } else { 1.0 };
+    let w = List::filled(n, 1.0);
+    for j in 0..n {
+        let p = 1.0;
+        for k in 0..n {
+            if k != j { p *= cap * (xs[j] - xs[k]); }
+        }
+        w[j] = 1.0 / p;
+    }
+    Barycentric { x: xs.clone(), y: ys.clone(), w }
+}
+
+impl Barycentric {
+    /// The weights, `1 / prod_{k != j} c (x[j] - x[k])` with the capacity
+    /// scale `c`.
+    ///
+    /// ```nabi
+    /// let p = try interpolate::barycentric([0, 1, 2], [0, 0, 0]);
+    /// let w = p.weights();
+    /// assert(w[0] == w[2] && w[1] == -2.0 * w[0]);
+    /// ```
+    pub fn weights(self) -> Vector<f64> { Array::from(self.w.clone()) }
+}
+
+impl Curve for Barycentric {
+    fn at(self, x: f64) -> f64 {
+        let (num, den) = (0.0, 0.0);
+        for j in 0..self.x.len() {
+            let d = x - self.x[j];
+            if d == 0.0 { return self.y[j]; }
+            let t = self.w[j] / d;
+            num += t * self.y[j];
+            den += t;
+        }
+        num / den
+    }
+}

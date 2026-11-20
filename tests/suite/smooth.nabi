@@ -1,0 +1,122 @@
+use pkg::tests::suite::{close, expect, linspace, sorted, throws_kind, uniform};
+use pkg::{Curve, Edge, Polynomial};
+use core::array::Vector;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn noisy_sine(n: usize, sd: f64, seed: u64) -> (Vector<f64>, Vector<f64>) {
+    let x = sorted(n, 0.0, 2.0 * f64::PI, seed);
+    let g = Xoshiro256PlusPlus::seed(seed + 1);
+    let ys: List<f64> = [];
+    for t in x { ys.push(t.sin() + sd * g.normal()); }
+    (x, Vector::<f64>::from(ys))
+}
+
+#[test]
+fn spline_limits() {
+    let x = linspace(0.0, 10.0, 30);
+    let y = uniform(30, -1.0, 1.0, 4);
+    // lam -> 0 interpolates.
+    let s = try! pkg::make_smoothing_spline(x, y, 1e-14);
+    for i in 0..30 { close(s.at(x[i]), y[i], 1e-9, "interpolates"); }
+    // lam -> inf: the least-squares line.
+    let l = try! pkg::make_smoothing_spline(x, y, 1e12);
+    let line = try! Polynomial::fit(x, y, 1);
+    for t in [0.5, 5.0, 9.5] { close(l.at(t), line.at(t), 1e-6, "linear limit"); }
+    // A line is reproduced at any lam; natural ends.
+    let yl = x .* 2.0 .- 1.0;
+    let s2 = try! pkg::make_smoothing_spline(x, yl, 3.0);
+    for t in [0.2, 4.4, 9.0] { close(s2.at(t), 2.0 * t - 1.0, 1e-10, "line kept"); }
+    close(s.derivative(2).at(x[0]), 0.0, 1e-9, "natural start");
+    close(s.derivative(2).at(x[29]), 0.0, 1e-6, "natural end");
+}
+
+#[test]
+fn spline_gcv() {
+    let (x, y) = noisy_sine(200, 0.1, 7);
+    let s = try! pkg::make_smoothing_spline(x, y);
+    let err = 0.0;
+    let raw = 0.0;
+    for i in 0..200 {
+        err += (s.at(x[i]) - x[i].sin()) ** 2;
+        raw += (y[i] - x[i].sin()) ** 2;
+    }
+    let (rmse, noise) = ((err / 200.0).sqrt(), (raw / 200.0).sqrt());
+    expect(rmse < 0.5 * noise && rmse < 0.05, f"gcv rmse {rmse} vs noise {noise}");
+    // Weights: a heavy weight pulls the fit to its point.
+    let w = Vector::<f64>::from(List::filled(200, 1.0));
+    w[50] = 1e8;
+    let sw = try! pkg::make_smoothing_spline(x, y, 0.1, w);
+    close(sw.at(x[50]), y[50], 1e-5, "weighted point");
+    expect(throws_kind(|| { _ = try pkg::make_smoothing_spline(Vector::<f64>::from([0.0, 1.0]), Vector::<f64>::from([0.0, 1.0])); }, "TooFewPoints"), "few");
+    expect(throws_kind(|| { _ = try pkg::make_smoothing_spline(Vector::<f64>::from([0.0, 2.0, 1.0]), Vector::<f64>::from([0.0, 1.0, 1.0])); }, "NotSorted"), "sorted");
+    expect(throws_kind(|| { _ = try pkg::make_smoothing_spline(x, y, -1.0); }, "BadArgument"), "lam < 0");
+}
+
+#[test]
+fn savgol_tables() {
+    // Savitzky and Golay's tables: quadratic, 5 and 7 points; first
+    // derivative, 5 points (-2 -1 0 1 2) / 10.
+    let c5 = try! pkg::savgol_coeffs(5, 2);
+    let t5 = [-3.0, 12.0, 17.0, 12.0, -3.0];
+    for j in 0..5 { close(c5[j] * 35.0, t5[j], 1e-12, "5-point"); }
+    let c7 = try! pkg::savgol_coeffs(7, 3);
+    let t7 = [-2.0, 3.0, 6.0, 7.0, 6.0, 3.0, -2.0];
+    for j in 0..7 { close(c7[j] * 21.0, t7[j], 1e-12, "7-point cubic"); }
+    let d5 = try! pkg::savgol_coeffs(5, 2, 1);
+    let td = [-2.0, -1.0, 0.0, 1.0, 2.0];
+    for j in 0..5 { close(d5[j] * 10.0, td[j], 1e-12, "derivative"); }
+    let h = try! pkg::savgol_coeffs(5, 2, 1, 0.5);
+    close(h[4], 0.4, 1e-12, "delta");
+    expect(throws_kind(|| { _ = try pkg::savgol_coeffs(4, 2); }, "BadArgument"), "even");
+    expect(throws_kind(|| { _ = try pkg::savgol_coeffs(5, 5); }, "BadArgument"), "order");
+}
+
+#[test]
+fn savgol_preserves_polynomials() {
+    let x = linspace(-3.0, 4.0, 50);
+    let q = Polynomial::new(Vector::<f64>::from([1.0, -2.0, 0.5, 0.25]));
+    let dx = x[1] - x[0];
+    let y = q.eval(x);
+    let s = try! pkg::savgol_filter(y, 9, 3);
+    for i in 0..50 { close(s[i], y[i], 1e-10, f"value {i}"); }
+    let d = try! pkg::savgol_filter(y, 9, 3, deriv: 1, delta: dx);
+    for i in 0..50 { close(d[i], q.deriv(1).at(x[i]), 1e-9, f"deriv {i}"); }
+    // Other edge modes agree with Interp in the interior.
+    for m in [Edge::Mirror, Edge::Nearest, Edge::Constant(0.0), Edge::Wrap] {
+        let e = try! pkg::savgol_filter(y, 9, 3, mode: m);
+        for i in 4..46 { close(e[i], y[i], 1e-10, "interior"); }
+    }
+    let n = try! pkg::savgol_filter(Vector::<f64>::from([1.0, 2.0, 3.0, 4.0]), 5, 1, mode: Edge::Nearest);
+    close(n[0], 1.6, 1e-12, "nearest edge");     // mean of 1 1 1 2 3
+    let w = try! pkg::savgol_filter(Vector::<f64>::from([5.0, 5.0, 5.0]), 5, 2, mode: Edge::Wrap);
+    expect(w[0] == 5.0 || (w[0] - 5.0).abs() < 1e-12, "wrap constant");
+    expect(throws_kind(|| { _ = try pkg::savgol_filter(Vector::<f64>::from([1.0, 2.0]), 5, 2); }, "BadArgument"), "short");
+}
+
+#[test]
+fn lowess_line_and_outlier() {
+    let x = uniform(60, 0.0, 10.0, 11);
+    let y = x .* 3.0 .+ 2.0;
+    let f = try! pkg::lowess(x, y);
+    for i in 0..60 { close(f[i], y[i], 1e-10, "line exact"); }
+    // An outlier is ignored after the robustness passes.
+    y[10] += 100.0;
+    let r = try! pkg::lowess(x, y, 0.5);
+    for i in 0..60 {
+        if i != 10 { close(r[i], 3.0 * x[i] + 2.0, 1e-6, f"robust {i}"); }
+    }
+    let plain = try! pkg::lowess(x, y, 0.5, 0);
+    let worst = 0.0;
+    for i in 0..60 { worst = worst.max((plain[i] - 3.0 * x[i] - 2.0).abs()); }
+    expect(worst > 1.0, "plain fit is pulled");
+    // delta interpolation stays exact on a line.
+    let d = try! pkg::lowess(x, x .* 3.0 .+ 2.0, 0.3, 1, 0.5);
+    for i in 0..60 { close(d[i], 3.0 * x[i] + 2.0, 1e-9, "delta"); }
+    let (xs, ys) = noisy_sine(300, 0.1, 21);
+    let s = try! pkg::lowess(xs, ys, 0.2);
+    let err = 0.0;
+    for i in 0..300 { err = err.max((s[i] - xs[i].sin()).abs()); }
+    expect(err < 0.15, f"sine {err}");
+    expect((try! pkg::lowess(Vector::<f64>::from([]), Vector::<f64>::from([]))).len() == 0, "empty");
+    expect(throws_kind(|| { _ = try pkg::lowess(x, y, 0.0); }, "BadArgument"), "frac");
+}

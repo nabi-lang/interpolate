@@ -1,0 +1,57 @@
+// Romberg integration of a function: trapezoid sums on halving steps,
+// extrapolated by Richardson's table.
+
+use pkg::InterpError;
+use pkg::integrate::adaptive::Quad;
+use pkg::integrate::sampled::Acc;
+use core::range::Range;
+
+/// The integral of `f` over the finite range `r` by Romberg's method:
+/// trapezoid sums with 2^k intervals, k up to `divmax`, and Richardson
+/// extrapolation to O(h^(2k + 2)). It stops when two diagonal entries
+/// of the table differ by at most `max(tol, rtol |value|)`; that
+/// difference is the error estimate. Best for smooth integrands; use
+/// `quad` for singular or oscillatory ones and infinite ranges. Throws
+/// `NoConvergence` after `divmax` halvings.
+///
+/// ```nabi
+/// let q = try interpolate::romberg(f64::exp, 0.0..1.0);
+/// assert((q.value - (f64::E - 1.0)).abs() < 1e-12);
+/// ```
+pub fn romberg(f: fn(f64) -> f64, r: Range<f64>, tol: f64 = 1.48e-8, rtol: f64 = 1.48e-8, divmax: usize = 10) throws (InterpError) -> Quad {
+    let (a, b) = (r.start, r.end);
+    if !a.is_finite() || !b.is_finite() {
+        throw InterpError::BadArgument { what: f"romberg needs a finite range, got {a}..{b}; use `quad` for an infinite one" };
+    }
+    if divmax < 1 || divmax > 30 { throw InterpError::BadArgument { what: f"divmax {divmax} is out of 1..=30" }; }
+    let h = b - a;
+    let row = List::filled(divmax + 1, 0.0);
+    row[0] = 0.5 * h * (f(a) + f(b));
+    let evals = 2usize;
+    let last = row[0];
+    for i in 1..=divmax {
+        let m = 1usize << (i - 1);
+        let step = h / ((2 * m) as f64);
+        let acc = Acc::new();
+        for j in 0..m { acc.add(f(a + step * ((2 * j + 1) as f64))); }
+        evals += m;
+        let prev = row[0];
+        row[0] = 0.5 * prev + step * acc.get();
+        let old = prev;
+        let p = 1.0;
+        for k in 1..=i {
+            p *= 4.0;
+            let keep = row[k];
+            row[k] = row[k - 1] + (row[k - 1] - old) / (p - 1.0);
+            old = keep;
+        }
+        let v = row[i];
+        let err = (v - last).abs();
+        if !v.is_finite() { throw InterpError::NotFinite { what: f"the integrand (the estimate is {v})" }; }
+        if err <= tol.max(rtol * v.abs()) {
+            return Quad { value: v, error: err, evals, intervals: 2 * m };
+        }
+        last = v;
+    }
+    throw InterpError::NoConvergence { iterations: divmax, value: last, error: (row[divmax] - row[divmax - 1]).abs() };
+}

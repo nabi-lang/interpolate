@@ -1,0 +1,4 @@
+//! Polynomials: power series and Chebyshev series.
+
+pub mod chebyshev;
+pub mod polynomial;

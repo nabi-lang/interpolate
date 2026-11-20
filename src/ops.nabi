@@ -1,0 +1,168 @@
+//! Notation for calculus on interpolants (feature `ops`, on by default):
+//!
+//!   ∂(s), ∂(s, n)   derivative of a spline or polynomial, as a spline
+//!                   or polynomial (autodiff's `∂`, also for functions)
+//!   ∇(a)            gradient of samples on a unit grid, as samples
+//!                   (autodiff's `∇`, also for functions)
+//!   ∫(f, a..b)      definite integral of a function (adaptive quadrature)
+//!   a ≈ b           approximately equal, for floats and arrays (`==`)
+//!   s ⊗ t           tensor product of two 1-d splines (linalg's `⊗`)
+//!
+//! `∂` and `∇` are autodiff's, re-exported: they give the derivative in
+//! the form of what they are given, never a value at a point (`∂(s)(x)`
+//! is the value), and this module only adds the interpolants to them,
+//! so it imports together with optimize's `ops`. `∘`, `+`, `-`, `*`,
+//! `/`, `%`, `**` on `Polynomial` come from core's operator traits and
+//! need no feature.
+
+pub use autodiff::ops::{Derive, Gradient, ∂, ∇};
+
+use pkg::{BSpline, Barycentric, Chebyshev, Curve, InterpError, Linear, PPoly, Polynomial, Step, TensorSpline};
+use core::array::Array;
+use core::range::Range;
+
+/// `∂(s)`, `∂(s, n)`: the derivative of a spline or polynomial as a
+/// spline or polynomial of the same kind.
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use interpolate::ops::∂;
+///
+/// let s = try interpolate::cubic_spline([0, 1, 2, 3], [0, 1, 8, 27]);   // x^3
+/// assert((∂(s).at(2.0) - 12.0).abs() < 1e-12);
+/// assert((∂(s, 2).at(2.0) - 12.0).abs() < 1e-12);
+/// assert((∂(∂(s)).at(1.0) - 6.0).abs() < 1e-12);
+///
+/// let p = interpolate::Polynomial::new([1, 0, 3]);          // 1 + 3x^2
+/// assert(∂(p) == interpolate::Polynomial::new([0, 6]));
+/// ```
+impl Derive for PPoly {
+    type Output = PPoly;
+    fn derive(self, nu: usize) -> PPoly { self.derivative(nu) }
+}
+
+impl Derive for BSpline {
+    type Output = BSpline;
+    fn derive(self, nu: usize) -> BSpline { self.derivative(nu) }
+}
+
+impl Derive for Polynomial {
+    type Output = Polynomial;
+    fn derive(self, nu: usize) -> Polynomial { self.deriv(nu) }
+}
+
+impl Derive for Chebyshev {
+    type Output = Chebyshev;
+    fn derive(self, nu: usize) -> Chebyshev { self.deriv(nu) }
+}
+
+/// What `∫` integrates: a function or closure (adaptive quadrature) or
+/// an interpolant (exactly when it is piecewise polynomial).
+pub trait Integrand {
+    /// The integral over `r`.
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64;
+}
+
+impl Integrand for fn(f64) -> f64 {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { (try pkg::quad(self, r)).value }
+}
+
+impl Integrand for PPoly {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { self.integrate(r) }
+}
+
+impl Integrand for BSpline {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { self.integrate(r) }
+}
+
+impl Integrand for Polynomial {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { self.integrate(r) }
+}
+
+impl Integrand for Linear {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { self.ppoly().integrate(r) }
+}
+
+impl Integrand for Step {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { (try pkg::quad(self.func(), r)).value }
+}
+
+impl Integrand for Barycentric {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { (try pkg::quad(self.func(), r)).value }
+}
+
+impl Integrand for Chebyshev {
+    fn integral(self, r: Range<f64>) throws (InterpError) -> f64 { (try pkg::quad(self.func(), r)).value }
+}
+
+/// `∫(f, a..b)`: the definite integral of a function or closure by
+/// adaptive Gauss-Kronrod (`quad`; call `quad` to read the error
+/// estimate), or of an interpolant: splines, `Linear` and `Polynomial`
+/// exactly (their `integrate`), the others by `quad`. Infinite ends
+/// work for functions: `∫(f, 0.0..f64::INFINITY)`.
+///
+/// ```nabi
+/// use interpolate::ops::∫;
+///
+/// assert((try ∫(f64::sin, 0.0..f64::PI) - 2.0).abs() < 1e-14);
+/// let k = 2.0;
+/// assert((try ∫(|x: f64| -> f64 { (-k * x * x).exp() }, 0.0..f64::INFINITY) - 0.6266570686577501).abs() < 1e-12);
+/// let s = try interpolate::cubic_spline([0, 1, 2, 3], [0, 1, 8, 27]);
+/// assert(try ∫(s, 0.0..3.0) == s.integrate(0.0..3.0));
+/// ```
+pub fn ∫<F: Integrand>(f: F, r: Range<f64>) throws (InterpError) -> f64 { try f.integral(r) }
+
+/// `a ≈ b`: equal up to rounding, `|a - b| <= 1e-9 max(1, |a|, |b|)`
+/// for every element (core's `is_close` with `rel` and `abs` both
+/// 1e-9), arrays of the same shape only. Binds like `==` and cannot
+/// chain. The named form with a tolerance is `close`.
+///
+/// ```nabi
+/// use interpolate::ops::Approx;
+/// use core::array::Vector;
+///
+/// assert(0.1 + 0.2 ≈ 0.3);
+/// let x: Vector<f64> = [1, 2];
+/// assert(x .* 3.0 ./ 3.0 ≈ x);
+/// assert(!(1.0 ≈ 1.001));
+/// assert(1.0.close(1.001, 0.01));
+/// ```
+pub trait Approx<Rhs = Self> {
+    /// `close(rhs, 1e-9)`.
+    #[infix("≈", like = "==")]
+    fn approx(self, rhs: Rhs) -> bool { self.close(rhs, 1e-9) }
+    /// Equal within `tol` relative to `max(1, |a|, |b|)`.
+    fn close(self, rhs: Rhs, tol: f64) -> bool;
+}
+
+impl Approx for f64 {
+    fn close(self, rhs: f64, tol: f64) -> bool { self.is_close(rhs, rel: tol, abs: tol) }
+}
+
+impl<const N: usize> Approx for Array<f64, N> {
+    fn close(self, rhs: Array<f64, N>, tol: f64) -> bool { self.shape() == rhs.shape() && self.all_close(rhs, rel: tol, abs: tol) }
+}
+
+/// `a ⊗ b`: the tensor-product spline `s(x, y) = a(x) b(y)`, through
+/// linalg's `Kron` trait, so one `⊗` works for matrices and splines.
+///
+/// ```nabi
+/// use interpolate::BSpline;
+/// use linalg::ops::Kron;
+///
+/// let a = try interpolate::make_interp_spline([0, 1, 2, 3], [0, 1, 4, 9]);     // x^2
+/// let b = try interpolate::make_interp_spline([0, 1, 2], [1, 2, 3], 1);        // y + 1
+/// let s = a ⊗ b;
+/// assert((s.at([1.5, 0.5]) - 3.375).abs() < 1e-13);
+/// ```
+impl linalg::ops::Kron<BSpline> for BSpline {
+    type Output = TensorSpline<2>;
+    fn kron(self, rhs: BSpline) -> TensorSpline<2> {
+        let (na, nb) = (self.c.len(), rhs.c.len());
+        let c = List::filled(na * nb, 0.0);
+        for i in 0..na {
+            for j in 0..nb { c[i * nb + j] = self.c[i] * rhs.c[j]; }
+        }
+        TensorSpline { t: [self.t, rhs.t], k: [self.k, rhs.k], n: [na, nb], c, mode: self.mode }
+    }
+}

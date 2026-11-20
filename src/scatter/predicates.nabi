@@ -1,0 +1,165 @@
+//! Robust geometric predicates after Shewchuk, "Adaptive Precision
+//! Floating-Point Arithmetic and Fast Robust Geometric Predicates"
+//! (1997): a floating-point evaluation with a forward error bound, and
+//! when the bound does not settle the sign, the exact value as a
+//! nonoverlapping expansion (two_sum / two_product, Dekker splitting, no
+//! FMA), whose last component carries the sign.
+
+// Half an ulp of 1.0.
+const EPS: f64 = 1.1102230246251565e-16;
+const SPLITTER: f64 = 134217729.0;
+const CCW_A: f64 = (3.0 + 16.0 * EPS) * EPS;
+const ICC_A: f64 = (10.0 + 96.0 * EPS) * EPS;
+
+/// Twice the signed area of the triangle `a b c`: positive when the
+/// points turn counterclockwise, negative clockwise, zero exactly when
+/// they are collinear. The sign is always right; the magnitude is the
+/// float estimate.
+///
+/// ```nabi
+/// use interpolate::scatter::orient2d;
+///
+/// assert(orient2d(0.0, 0.0, 1.0, 0.0, 0.0, 1.0) > 0.0);
+/// // Collinear to the last bit: a float formula would often say otherwise.
+/// assert(orient2d(0.5, 0.5, 12.0, 12.0, 24.0, 24.0) == 0.0);
+/// ```
+pub fn orient2d(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
+    let l = (ax - cx) * (by - cy);
+    let r = (ay - cy) * (bx - cx);
+    let det = l - r;
+    if (l > 0.0 && r <= 0.0) || (l < 0.0 && r >= 0.0) { return det; }
+    let bound = CCW_A * (l.abs() + r.abs());
+    if det >= bound || -det >= bound { return det; }
+    let p = mul(diff(ax, cx), diff(by, cy));
+    let q = mul(diff(ay, cy), diff(bx, cx));
+    top(sum(p, neg(q)))
+}
+
+/// Positive when `d` lies inside the circle through `a b c` (taken
+/// counterclockwise; the sign flips for a clockwise triangle), negative
+/// outside, zero exactly when the four points are cocircular.
+///
+/// ```nabi
+/// use interpolate::scatter::incircle;
+///
+/// assert(incircle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.2, 0.2) > 0.0);
+/// assert(incircle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0) == 0.0);   // the square's corner
+/// ```
+pub fn incircle(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, dx: f64, dy: f64) -> f64 {
+    let (adx, ady) = (ax - dx, ay - dy);
+    let (bdx, bdy) = (bx - dx, by - dy);
+    let (cdx, cdy) = (cx - dx, cy - dy);
+    let (bc, cb) = (bdx * cdy, cdx * bdy);
+    let (ca, ac) = (cdx * ady, adx * cdy);
+    let (ab, ba) = (adx * bdy, bdx * ady);
+    let al = adx * adx + ady * ady;
+    let bl = bdx * bdx + bdy * bdy;
+    let cl = cdx * cdx + cdy * cdy;
+    let det = al * (bc - cb) + bl * (ca - ac) + cl * (ab - ba);
+    let perm = (bc.abs() + cb.abs()) * al + (ca.abs() + ac.abs()) * bl + (ab.abs() + ba.abs()) * cl;
+    let bound = ICC_A * perm;
+    if det > bound || -det > bound { return det; }
+    let (ex, ey) = (diff(ax, dx), diff(ay, dy));
+    let (fx, fy) = (diff(bx, dx), diff(by, dy));
+    let (gx, gy) = (diff(cx, dx), diff(cy, dy));
+    let lift_a = sum(mul(ex, ex), mul(ey, ey));
+    let lift_b = sum(mul(fx, fx), mul(fy, fy));
+    let lift_c = sum(mul(gx, gx), mul(gy, gy));
+    let t1 = mul(lift_a, sum(mul(fx, gy), neg(mul(gx, fy))));
+    let t2 = mul(lift_b, sum(mul(gx, ey), neg(mul(ex, gy))));
+    let t3 = mul(lift_c, sum(mul(ex, fy), neg(mul(fx, ey))));
+    top(sum(sum(t1, t2), t3))
+}
+
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b;
+    let bv = x - a;
+    let av = x - bv;
+    (x, (a - av) + (b - bv))
+}
+
+fn fast_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b;
+    (x, b - (x - a))
+}
+
+fn split(a: f64) -> (f64, f64) {
+    let c = SPLITTER * a;
+    let hi = c - (c - a);
+    (hi, a - hi)
+}
+
+fn two_product(a: f64, b: f64) -> (f64, f64) {
+    let x = a * b;
+    let (ah, al) = split(a);
+    let (bh, bl) = split(b);
+    let e1 = x - ah * bh;
+    let e2 = e1 - al * bh;
+    let e3 = e2 - ah * bl;
+    (x, al * bl - e3)
+}
+
+/// `a - b` exactly, as an expansion (low component first).
+fn diff(a: f64, b: f64) -> List<f64> {
+    let x = a - b;
+    let bv = a - x;
+    let av = x + bv;
+    let y = (a - av) + (bv - b);
+    let e: List<f64> = [];
+    if y != 0.0 { e.push(y); }
+    if x != 0.0 { e.push(x); }
+    e
+}
+
+fn neg(e: List<f64>) -> List<f64> {
+    let out = List::with_capacity(e.len());
+    for v in e { out.push(-v); }
+    out
+}
+
+/// `e + b`, zero components dropped (Shewchuk's Grow-Expansion).
+fn grow(e: List<f64>, b: f64) -> List<f64> {
+    let out = List::with_capacity(e.len() + 1);
+    let q = b;
+    for v in e {
+        let (s, h) = two_sum(q, v);
+        q = s;
+        if h != 0.0 { out.push(h); }
+    }
+    if q != 0.0 { out.push(q); }
+    out
+}
+
+/// `e + f`, O(len(e) len(f)); the expansions here stay short.
+fn sum(e: List<f64>, f: List<f64>) -> List<f64> {
+    let out = e;
+    for v in f { out = grow(out, v); }
+    out
+}
+
+/// `e * b`, zero components dropped (Scale-Expansion).
+fn scale(e: List<f64>, b: f64) -> List<f64> {
+    let out: List<f64> = [];
+    if e.len() == 0 || b == 0.0 { return out; }
+    let (q, h) = two_product(e[0], b);
+    if h != 0.0 { out.push(h); }
+    for i in 1..e.len() {
+        let (t1, t0) = two_product(e[i], b);
+        let (s, h1) = two_sum(q, t0);
+        if h1 != 0.0 { out.push(h1); }
+        let (q2, h2) = fast_two_sum(t1, s);
+        q = q2;
+        if h2 != 0.0 { out.push(h2); }
+    }
+    if q != 0.0 { out.push(q); }
+    out
+}
+
+fn mul(e: List<f64>, f: List<f64>) -> List<f64> {
+    let out: List<f64> = [];
+    for v in f { out = sum(out, scale(e, v)); }
+    out
+}
+
+/// The most significant component: the sign of the expansion.
+fn top(e: List<f64>) -> f64 { if e.len() == 0 { 0.0 } else { e[e.len() - 1] } }

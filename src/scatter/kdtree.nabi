@@ -1,0 +1,479 @@
+//! A k-d tree over points in any dimension (Bentley 1975): median splits
+//! on the widest axis found by quickselect, leaf buckets, and
+//! branch-and-bound queries that visit the nearer child first and skip a
+//! far child once its splitting plane is farther than the current k-th
+//! neighbor. Everything sits in GC buffers so batch queries can share
+//! the tree across `par` workers.
+
+use pkg::InterpError;
+use pkg::data::{arg, finite, list};
+use bare::mem::GcBuf;
+use core::array::{Array, Matrix, Vector};
+
+const LEAF: usize = 12;
+// From this many queries a batch is split across the workers.
+const PAR: usize = 2048;
+const CHUNK: usize = 512;
+
+/// The `k` nearest neighbors of a point: their row indices into the
+/// tree's points and their Euclidean distances, nearest first.
+///
+/// ```nabi
+/// use interpolate::scatter::KdTree;
+/// use core::array::Matrix;
+///
+/// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 2]];
+/// let nb = try (try KdTree::new(p)).knn([0.9, 0.1], 2);
+/// assert(nb.indices[0] == 1 && nb.indices[1] == 0);
+/// assert((nb.distances[0] - 0.02.sqrt()).abs() < 1e-15);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Neighbors {
+    pub indices: Vector<usize>;
+    pub distances: Vector<f64>;
+}
+
+/// A k-d tree over the rows of an n x d matrix. Build O(n log n);
+/// a query for `k` neighbors takes O(log n + k) expected time on
+/// well-spread points in low dimension (d up to about 10; past that a
+/// query tends to visit most leaves).
+///
+/// ```nabi
+/// use interpolate::scatter::KdTree;
+/// use core::array::{Matrix, Vector};
+///
+/// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [1, 1]];
+/// let t = try KdTree::new(p);
+/// let (i, d) = try t.nearest([0.8, 0.9]);
+/// assert(i == 3 && (d - 0.05.sqrt()).abs() < 1e-15);
+/// assert(try t.radius([0.0, 0.0], 1.0) == Vector::<usize>::from([0, 1, 2]));
+/// ```
+#[derive(Clone)]
+pub struct KdTree {
+    n: usize;
+    d: usize;
+    // Points in tree order, n x d, and each one's row in the input.
+    pts: GcBuf<f64>;
+    idx: GcBuf<usize>;
+    // Node j covers tree-order points lo[j]..hi[j]; an inner node
+    // splits on axis dim[j] at split[j], children left[j] and
+    // left[j] + 1. A leaf has left[j] == 0.
+    lo: GcBuf<usize>;
+    hi: GcBuf<usize>;
+    dim: GcBuf<usize>;
+    split: GcBuf<f64>;
+    left: GcBuf<usize>;
+}
+
+fn buf<T>(n: usize) -> GcBuf<T> { unsafe { GcBuf::new(n + 1) } }
+
+impl KdTree {
+    /// The tree over the rows of `points` (n x d, d >= 1, all finite).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[3], [1], [2]];          // d = 1 works too
+    /// assert((try KdTree::new(p)).len() == 3);
+    /// ```
+    pub fn new(points: Matrix<f64>) throws (InterpError) -> KdTree {
+        let s = points.shape();
+        let (n, d) = (s[0], s[1]);
+        try arg(d >= 1, "points need at least one column (one coordinate per axis)");
+        let src = list(points);
+        try finite(src, "points");
+        let orig: GcBuf<f64> = buf(n * d);
+        unsafe { for i in 0..n * d { orig.set(i, src[i]); } }
+        let ord: GcBuf<usize> = buf(n);
+        unsafe { for i in 0..n { ord.set(i, i); } }
+        let cap = 4 * n / (LEAF + 1) + 4;
+        let t = KdTree {
+            n, d,
+            pts: buf(n * d), idx: ord,
+            lo: buf(cap), hi: buf(cap), dim: buf(cap), split: buf(cap), left: buf(cap),
+        };
+        let count = 1usize;
+        t.grow(orig, 0, 0, n, ref count);
+        unsafe {
+            for i in 0..n {
+                let r = t.idx.get(i);
+                for k in 0..d { t.pts.set(i * d + k, orig.get(r * d + k)); }
+            }
+        }
+        t
+    }
+
+    /// Splits node `j` over `ord[lo..hi]`; `count` is the next free node.
+    fn grow(self, orig: GcBuf<f64>, j: usize, lo: usize, hi: usize, ref count: usize) {
+        unsafe {
+            self.lo.set(j, lo);
+            self.hi.set(j, hi);
+            self.left.set(j, 0);
+            if hi - lo <= LEAF { return; }
+            let d = self.d;
+            // The widest axis of the points' bounding box.
+            let (best, wide) = (0usize, -1.0);
+            for k in 0..d {
+                let (mn, mx) = (f64::INFINITY, f64::NEG_INFINITY);
+                for i in lo..hi {
+                    let v = orig.get(self.idx.get(i) * d + k);
+                    if v < mn { mn = v; }
+                    if v > mx { mx = v; }
+                }
+                if mx - mn > wide { best = k; wide = mx - mn; }
+            }
+            if !(wide > 0.0) { return; }
+            let mid = (lo + hi) / 2;
+            select(self.idx, orig, d, best, lo, hi, mid);
+            let c = count;
+            count += 2;
+            self.dim.set(j, best);
+            self.split.set(j, orig.get(self.idx.get(mid) * d + best));
+            self.left.set(j, c);
+            self.grow(orig, c, lo, mid, ref count);
+            self.grow(orig, c + 1, mid, hi, ref count);
+        }
+    }
+
+    /// The number of points.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = Matrix::zeros([0, 2]);
+    /// assert((try KdTree::new(p)).len() == 0);
+    /// ```
+    pub fn len(self) -> usize { self.n }
+
+    /// The dimension d.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0, 0]];
+    /// assert((try KdTree::new(p)).dim() == 3);
+    /// ```
+    pub fn dim(self) -> usize { self.d }
+
+    fn point(self, q: Vector<f64>) throws (InterpError) -> List<f64> {
+        let xs = list(q);
+        try arg(xs.len() == self.d, f"the query point has {xs.len()} coordinates, the tree {self.d}; pass one per axis");
+        try finite(xs, "query point");
+        xs
+    }
+
+    /// The `k` nearest points to `q` (fewer when the tree holds fewer),
+    /// nearest first; ties keep the lower index first.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let p: Matrix<f64> = [[0], [10], [3], [7]];
+    /// let nb = try (try KdTree::new(p)).knn([4.0], 3);
+    /// assert(nb.indices == Vector::<usize>::from([2, 3, 0]));
+    /// ```
+    pub fn knn(self, q: Vector<f64>, k: usize) throws (InterpError) -> Neighbors {
+        let xs = try self.point(q);
+        let h = Heap::new(k);
+        let st = Stack::new();
+        self.search(xs, 0, ref h, st);
+        h.sort();
+        let kk = h.len;
+        let ds = List::filled(kk, 0.0);
+        let ix = List::filled(kk, 0usize);
+        for m in 0..kk {
+            ds[m] = h.d[m].sqrt();
+            ix[m] = h.i[m];
+        }
+        Neighbors { indices: Array::from(ix), distances: Array::from(ds) }
+    }
+
+    /// The nearest point to `q`: its row and distance. `BadArgument`
+    /// on an empty tree.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [5, 5]];
+    /// assert((try (try KdTree::new(p)).nearest([4.0, 4.0])).0 == 1);
+    /// ```
+    pub fn nearest(self, q: Vector<f64>) throws (InterpError) -> (usize, f64) {
+        try arg(self.n > 0, "the tree is empty; build it from at least one point");
+        let nb = try self.knn(q, 1);
+        (nb.indices[0], nb.distances[0])
+    }
+
+    /// The rows of every point within distance `r` of `q` (the boundary
+    /// included), in rising row order.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let p: Matrix<f64> = [[0], [1], [2], [3]];
+    /// assert(try (try KdTree::new(p)).radius([1.5], 0.5) == Vector::<usize>::from([1, 2]));
+    /// ```
+    pub fn radius(self, q: Vector<f64>, r: f64) throws (InterpError) -> Vector<usize> {
+        let xs = try self.point(q);
+        try arg(r >= 0.0, f"radius {r} is negative; pass r >= 0");
+        let out: List<usize> = [];
+        if self.n == 0 { return Array::from(out); }
+        let r2 = r * r;
+        let st = Stack::new();
+        st.push(0, 0.0);
+        let d = self.d;
+        unsafe {
+            while st.len() > 0 {
+                let (j, b) = st.pop();
+                if b > r2 { continue; }
+                let c = self.left.get(j);
+                if c == 0 {
+                    for i in self.lo.get(j)..self.hi.get(j) {
+                        let s = 0.0;
+                        for k in 0..d {
+                            let t = self.pts.get(i * d + k) - xs[k];
+                            s += t * t;
+                        }
+                        if s <= r2 { out.push(self.idx.get(i)); }
+                    }
+                    continue;
+                }
+                let t = xs[self.dim.get(j)] - self.split.get(j);
+                let b2 = b.max(t * t);
+                if t < 0.0 {
+                    st.push(c + 1, b2);
+                    st.push(c, b);
+                } else {
+                    st.push(c, b2);
+                    st.push(c + 1, b);
+                }
+            }
+        }
+        out.sort();
+        Array::from(out)
+    }
+
+    /// The `k` nearest points to every row of `qs` (m x d): rows of
+    /// indices and of distances, m x min(k, n), nearest first. Batches
+    /// of 2048 queries and more run across the workers.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::KdTree;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// let qs: Matrix<f64> = [[0.9, 0], [0, 0.8]];
+    /// let (idx, dist) = try (try KdTree::new(p)).query(qs, 1);
+    /// assert(idx[0, 0] == 1 && idx[1, 0] == 2 && (dist[1, 0] - 0.2).abs() < 1e-15);
+    /// ```
+    pub fn query(self, qs: Matrix<f64>, k: usize) throws (InterpError) -> (Matrix<usize>, Matrix<f64>) {
+        let s = qs.shape();
+        try arg(s[1] == self.d, f"queries have {s[1]} columns, the tree {self.d}; pass one column per axis");
+        let src = list(qs);
+        try finite(src, "query points");
+        let (m, d) = (s[0], self.d);
+        let kk = k.min(self.n);
+        let q: GcBuf<f64> = buf(m * d);
+        unsafe { for i in 0..m * d { q.set(i, src[i]); } }
+        let oi: GcBuf<usize> = buf(m * kk);
+        let od: GcBuf<f64> = buf(m * kk);
+        let tree = self;
+        let run = |c: usize| {
+            let h = Heap::new(kk);
+            let st = Stack::new();
+            let xs = List::filled(d, 0.0);
+            for r in (c * CHUNK)..m.min((c + 1) * CHUNK) {
+                unsafe { for t in 0..d { xs[t] = q.get(r * d + t); } }
+                h.clear();
+                tree.search(xs, 0, ref h, st);
+                h.sort();
+                unsafe {
+                    for t in 0..kk {
+                        oi.set(r * kk + t, h.i[t]);
+                        od.set(r * kk + t, h.d[t].sqrt());
+                    }
+                }
+            }
+        };
+        let chunks = (m + CHUNK - 1) / CHUNK;
+        if m >= PAR {
+            par::for_each(0..chunks, run);
+        } else {
+            for c in 0..chunks { run(c); }
+        }
+        let li = List::filled(m * kk, 0usize);
+        let ld = List::filled(m * kk, 0.0);
+        unsafe {
+            for t in 0..m * kk {
+                li[t] = oi.get(t);
+                ld[t] = od.get(t);
+            }
+        }
+        (Array::view_list(li, [m, kk]), Array::view_list(ld, [m, kk]))
+    }
+
+    /// Branch and bound from node `j`, keeping the best in `h`.
+    pub(pkg) fn search(self, xs: List<f64>, j: usize, ref h: Heap, st: Stack) {
+        if self.n == 0 || h.cap == 0 { return; }
+        let d = self.d;
+        st.clear();
+        st.push(j, 0.0);
+        unsafe {
+            while st.len() > 0 {
+                let (node, b) = st.pop();
+                if h.len == h.cap && b > h.worst() { continue; }
+                let c = self.left.get(node);
+                if c == 0 {
+                    for i in self.lo.get(node)..self.hi.get(node) {
+                        let s = 0.0;
+                        for k in 0..d {
+                            let t = self.pts.get(i * d + k) - xs[k];
+                            s += t * t;
+                        }
+                        h.offer(s, self.idx.get(i));
+                    }
+                    continue;
+                }
+                let t = xs[self.dim.get(node)] - self.split.get(node);
+                let b2 = b.max(t * t);
+                // Pushed last, popped first: the nearer child.
+                if t < 0.0 {
+                    st.push(c + 1, b2);
+                    st.push(c, b);
+                } else {
+                    st.push(c, b2);
+                    st.push(c + 1, b);
+                }
+            }
+        }
+    }
+}
+
+/// Moves the `m`-th smallest of `ord[lo..hi]` by coordinate `k` to
+/// position `m`, smaller ones before it, larger after (Hoare partition,
+/// median of three).
+fn select(ord: GcBuf<usize>, p: GcBuf<f64>, d: usize, k: usize, lo: usize, hi: usize, m: usize) {
+    let (l, r) = (lo, hi - 1);
+    unsafe {
+        while r > l {
+            let key = |i: usize| -> f64 { p.get(ord.get(i) * d + k) };
+            let mid = l + (r - l) / 2;
+            let (a, b, c) = (key(l), key(mid), key(r));
+            let pv = if a < b { if b < c { b } else if a < c { c } else { a } } else if a < c { a } else if b < c { c } else { b };
+            let (i, j) = (l, r);
+            loop {
+                while key(i) < pv { i += 1; }
+                while key(j) > pv { j -= 1; }
+                if i <= j {
+                    let t = ord.get(i);
+                    ord.set(i, ord.get(j));
+                    ord.set(j, t);
+                    i += 1;
+                    if j == 0 { break; }
+                    j -= 1;
+                }
+                if i > j { break; }
+            }
+            if m <= j { r = j; } else if m >= i { l = i; } else { return; }
+        }
+    }
+}
+
+/// The best `cap` candidates so far: a max-heap on squared distance,
+/// ties broken by the higher row on top.
+pub(pkg) struct Heap {
+    pub(pkg) d: List<f64>;
+    pub(pkg) i: List<usize>;
+    pub(pkg) len: usize;
+    pub(pkg) cap: usize;
+}
+
+impl Heap {
+    pub(pkg) fn new(cap: usize) -> Heap { Heap { d: List::filled(cap, 0.0), i: List::filled(cap, 0usize), len: 0, cap } }
+
+    pub(pkg) fn clear(ref self) { self.len = 0; }
+
+    pub(pkg) fn worst(self) -> f64 { self.d[0] }
+
+    fn above(self, a: usize, b: usize) -> bool { self.d[a] > self.d[b] || (self.d[a] == self.d[b] && self.i[a] > self.i[b]) }
+
+    fn swap(self, a: usize, b: usize) {
+        let (td, ti) = (self.d[a], self.i[a]);
+        self.d[a] = self.d[b];
+        self.i[a] = self.i[b];
+        self.d[b] = td;
+        self.i[b] = ti;
+    }
+
+    pub(pkg) fn offer(ref self, s: f64, r: usize) {
+        if self.len < self.cap {
+            let c = self.len;
+            self.d[c] = s;
+            self.i[c] = r;
+            self.len += 1;
+            while c > 0 {
+                let p = (c - 1) / 2;
+                if !self.above(c, p) { break; }
+                self.swap(c, p);
+                c = p;
+            }
+            return;
+        }
+        if s > self.d[0] || (s == self.d[0] && r > self.i[0]) { return; }
+        self.d[0] = s;
+        self.i[0] = r;
+        self.sift(0, self.len);
+    }
+
+    fn sift(self, at: usize, n: usize) {
+        let c = at;
+        loop {
+            let (l, r) = (2 * c + 1, 2 * c + 2);
+            let top = c;
+            if l < n && self.above(l, top) { top = l; }
+            if r < n && self.above(r, top) { top = r; }
+            if top == c { break; }
+            self.swap(c, top);
+            c = top;
+        }
+    }
+
+    /// Heap sort in place: nearest first.
+    pub(pkg) fn sort(self) {
+        let n = self.len;
+        while n > 1 {
+            n -= 1;
+            self.swap(0, n);
+            self.sift(0, n);
+        }
+    }
+}
+
+/// The node stack of a query, with each node's lower bound.
+pub(pkg) struct Stack {
+    j: List<usize>;
+    b: List<f64>;
+}
+
+impl Stack {
+    pub(pkg) fn new() -> Stack { Stack { j: [], b: [] } }
+
+    pub(pkg) fn len(self) -> usize { self.j.len() }
+
+    pub(pkg) fn clear(self) {
+        self.j.clear();
+        self.b.clear();
+    }
+
+    pub(pkg) fn push(self, j: usize, b: f64) {
+        self.j.push(j);
+        self.b.push(b);
+    }
+
+    pub(pkg) fn pop(self) -> (usize, f64) { (self.j.pop() ?? 0, self.b.pop() ?? 0.0) }
+}

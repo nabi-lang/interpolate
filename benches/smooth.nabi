@@ -1,0 +1,56 @@
+// Smoothing and polynomial evaluation on seeded random data; items are
+// samples, so items/s reads as samples per second.
+
+use pkg::{Curve, Polynomial};
+use core::array::{Array, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn noisy(n: usize, seed: u64) -> (Vector<f64>, Vector<f64>) {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(n);
+    let ys: List<f64> = List::with_capacity(n);
+    for i in 0..n {
+        let t = 10.0 * (i as f64) / (n as f64);
+        xs.push(t);
+        ys.push(t.sin() + 0.1 * g.normal());
+    }
+    (Array::from(xs), Array::from(ys))
+}
+
+#[bench]
+fn smoothing_spline_gcv_1e5(b: Bench) {
+    let (x, y) = noisy(100000, 1);
+    b.set_items(100000);
+    b.iter(|| try! pkg::make_smoothing_spline(black_box(x), black_box(y)));
+}
+
+#[bench]
+fn smoothing_spline_fixed_1e5(b: Bench) {
+    let (x, y) = noisy(100000, 1);
+    b.set_items(100000);
+    b.iter(|| try! pkg::make_smoothing_spline(black_box(x), black_box(y), 1e-4));
+}
+
+#[bench]
+fn savgol_1e6(b: Bench) {
+    let (_, y) = noisy(1000000, 2);
+    b.set_items(1000000);
+    b.iter(|| try! pkg::savgol_filter(black_box(y), 11, 3));
+}
+
+#[bench]
+fn lowess_1e4(b: Bench) {
+    let (x, y) = noisy(10000, 3);
+    b.set_items(10000);
+    b.iter(|| try! pkg::lowess(black_box(x), black_box(y), 0.1));
+}
+
+#[bench]
+fn polynomial_eval_1e6(b: Bench) {
+    let (x, _) = noisy(1000000, 4);
+    let p = Polynomial::new([1.0, -0.5, 0.25, 0.125, -0.0625, 0.03125]);
+    b.set_items(1000000);
+    b.iter(|| p.eval(black_box(x)));
+}

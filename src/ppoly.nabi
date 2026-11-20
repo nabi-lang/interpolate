@@ -1,0 +1,377 @@
+//! Piecewise polynomials: the form every cubic interpolant (spline,
+//! PCHIP, Akima, Hermite) is evaluated, differentiated, integrated and
+//! solved in.
+
+use pkg::curve::{fill, wrap};
+use pkg::data::{arg, enough, finite, interval, interval_from, list, rising, vector};
+use pkg::{Curve, Extrapolate, InterpError};
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+
+/// A piecewise polynomial of degree `k` on rising breakpoints `b[0] <
+/// ... < b[n]`: on `[b[i], b[i + 1])` it is `sum_j c[i, j] (x - b[i])^j`.
+/// Evaluation is a binary search and Horner's rule (O(log n + k)); a
+/// sorted `eval` walks the intervals instead (O(1) per point). The
+/// coefficients are in absolute units, `c[i, j] ~ y / h^j` for spacing
+/// `h`, so data whose `y / h^k` leaves the f64 range (spacing 1e-150
+/// with values 1e150) overflow: rescale x first.
+///
+/// ```nabi
+/// use interpolate::{Curve, PPoly};
+/// use core::array::Matrix;
+///
+/// // x on [0, 1), then 1 + 2 (x - 1) on [1, 2].
+/// let c: Matrix<f64> = [[0, 1], [1, 2]];
+/// let p = try PPoly::new([0, 1, 2], c);
+/// assert(p.at(0.5) == 0.5 && p.at(1.5) == 2.0);
+/// assert(p.integrate(0.0..2.0) == 2.5);
+/// ```
+#[derive(Clone)]
+pub struct PPoly {
+    pub(pkg) b: List<f64>;
+    pub(pkg) k: usize;
+    // Interval i holds c[i * (k + 1) + j], the coefficient of t^j.
+    pub(pkg) c: List<f64>;
+    pub(pkg) mode: Extrapolate;
+}
+
+impl PPoly {
+    /// The piecewise polynomial with breakpoints `breaks` (n + 1 rising
+    /// values) and coefficients `coef` (n x (k + 1); column `j` is the
+    /// coefficient of `(x - breaks[i])^j`, ascending).
+    ///
+    /// ```nabi
+    /// use interpolate::{Curve, PPoly};
+    /// use core::array::Matrix;
+    ///
+    /// let c: Matrix<f64> = [[1, 0, 1]];            // 1 + x^2 on [0, 2]
+    /// let p = try PPoly::new([0, 2], c);
+    /// assert(p.at(2.0) == 5.0 && p.degree() == 2);
+    /// ```
+    pub fn new(breaks: Vector<f64>, coef: Matrix<f64>) throws (InterpError) -> PPoly {
+        let b = list(breaks).clone();
+        let s = coef.shape();
+        try enough(b.len(), 2);
+        try arg(s[0] == b.len() - 1, f"coef has {s[0]} rows for {b.len() - 1} intervals; give one row per interval");
+        try arg(s[1] >= 1, "coef needs at least one column (the constant term)");
+        try finite(b, "breaks");
+        try rising(b);
+        let c = coef.to_list();
+        try finite(c, "coef");
+        PPoly { b, k: s[1] - 1, c, mode: Extrapolate::Extend }
+    }
+
+    pub(pkg) fn raw(b: List<f64>, k: usize, c: List<f64>) -> PPoly { PPoly { b, k, c, mode: Extrapolate::Extend } }
+
+    /// This polynomial with extrapolation `mode` (see `Extrapolate`).
+    ///
+    /// ```nabi
+    /// use interpolate::{Curve, Extrapolate};
+    ///
+    /// let s = try interpolate::pchip([0, 1, 2], [0, 1, 0]);
+    /// assert(s.extrapolate(Extrapolate::Fill(f64::NAN)).at(3.0).is_nan());
+    /// ```
+    pub fn extrapolate(self, mode: Extrapolate) -> PPoly { PPoly { b: self.b, k: self.k, c: self.c, mode } }
+
+    /// The degree of the pieces.
+    pub fn degree(self) -> usize { self.k }
+
+    /// The breakpoints, n + 1 rising values.
+    ///
+    /// ```nabi
+    /// let s = try interpolate::cubic_spline([0, 1, 3], [1, 2, 0]);
+    /// assert(s.breaks().len() == 3);
+    /// ```
+    pub fn breaks(self) -> Vector<f64> { vector(self.b.clone()) }
+
+    /// The coefficients, n x (k + 1), ascending powers of `x - b[i]`.
+    ///
+    /// ```nabi
+    /// let s = try interpolate::cubic_spline([0, 1], [1, 3]);   // a line
+    /// let c = s.coefficients();
+    /// assert(c[0, 0] == 1.0 && c[0, 1] == 2.0 && c[0, 2] == 0.0);
+    /// ```
+    pub fn coefficients(self) -> Matrix<f64> { Array::from_list(self.c.clone(), [self.b.len() - 1, self.k + 1]) }
+
+    /// `(b[0], b[n])`.
+    pub fn domain(self) -> (f64, f64) { (self.b[0], self.b[self.b.len() - 1]) }
+
+    /// Piece `i` at `x`, Horner's rule.
+    pub(pkg) fn piece(self, i: usize, x: f64) -> f64 {
+        let t = x - self.b[i];
+        let o = i * (self.k + 1);
+        let s = self.c[o + self.k];
+        let j = self.k;
+        while j > 0 {
+            j -= 1;
+            s = s * t + self.c[o + j];
+        }
+        s
+    }
+
+    /// The `nu`-th derivative, a piecewise polynomial of degree `k - nu`
+    /// (zero once `nu > k`).
+    ///
+    /// ```nabi
+    /// use interpolate::Curve;
+    ///
+    /// let s = try interpolate::cubic_spline([0, 1, 2, 3], [0, 1, 8, 27]);   // x^3
+    /// assert((s.derivative(1).at(2.0) - 12.0).abs() < 1e-12);
+    /// assert((s.derivative(2).at(2.0) - 12.0).abs() < 1e-12);
+    /// ```
+    pub fn derivative(self, nu: usize = 1) -> PPoly {
+        if nu == 0 { return self; }
+        let n = self.b.len() - 1;
+        if nu > self.k {
+            return PPoly { b: self.b, k: 0, c: List::filled(n, 0.0), mode: self.mode };
+        }
+        let k2 = self.k - nu;
+        let c = List::filled(n * (k2 + 1), 0.0);
+        for i in 0..n {
+            for j in 0..=k2 {
+                // d^nu t^(j + nu) = (j + nu)! / j! t^j
+                let f = 1.0;
+                for m in (j + 1)..=(j + nu) { f *= m as f64; }
+                c[i * (k2 + 1) + j] = self.c[i * (self.k + 1) + j + nu] * f;
+            }
+        }
+        PPoly { b: self.b, k: k2, c, mode: self.mode }
+    }
+
+    /// The `nu`-th antiderivative, continuous and zero at `b[0]`.
+    ///
+    /// ```nabi
+    /// use interpolate::Curve;
+    ///
+    /// let s = try interpolate::cubic_spline([0, 1, 2], [1, 1, 1]);
+    /// assert((s.antiderivative(1).at(2.0) - 2.0).abs() < 1e-15);
+    /// ```
+    pub fn antiderivative(self, nu: usize = 1) -> PPoly {
+        let p = self;
+        for _ in 0..nu { p = p.integral_once(); }
+        p
+    }
+
+    fn integral_once(self) -> PPoly {
+        let n = self.b.len() - 1;
+        let k2 = self.k + 1;
+        let c = List::filled(n * (k2 + 1), 0.0);
+        for i in 0..n {
+            for j in 0..=self.k { c[i * (k2 + 1) + j + 1] = self.c[i * (self.k + 1) + j] / ((j + 1) as f64); }
+        }
+        let p = PPoly { b: self.b, k: k2, c, mode: self.mode };
+        // Constants that make the pieces meet.
+        let acc = 0.0;
+        for i in 0..n {
+            p.c[i * (k2 + 1)] = acc;
+            acc = p.piece(i, self.b[i + 1]);
+        }
+        p
+    }
+
+    /// The integral over `r` (`r.start > r.end` gives the negative),
+    /// following the extrapolation mode outside the breakpoints:
+    /// `Extend` integrates the end pieces, `Clamp` the end values,
+    /// `Fill(v)` the constant `v`, `Periodic` whole periods.
+    ///
+    /// ```nabi
+    /// use interpolate::Extrapolate;
+    ///
+    /// let s = try interpolate::linear([0, 1], [0, 1]).ppoly();
+    /// assert(s.integrate(0.0..1.0) == 0.5);
+    /// assert(s.extrapolate(Extrapolate::Periodic).integrate(0.0..3.0) == 1.5);
+    /// ```
+    pub fn integrate(self, r: Range<f64>) -> f64 {
+        let (a, z) = (r.start, r.end);
+        if a > z { return -self.integrate(z..a); }
+        let f = self.integral_once();
+        let (lo, hi) = self.domain();
+        let anti = |x: f64| -> f64 { f.piece(interval(f.b, x), x) };
+        match self.mode {
+            Extrapolate::Extend => anti(z) - anti(a),
+            Extrapolate::Periodic => {
+                let p = hi - lo;
+                let total = anti(hi);
+                let wrap1 = |x: f64| -> (f64, f64) {
+                    let k = ((x - lo) / p).floor();
+                    (k, lo + (x - lo - k * p).max(0.0).min(p))
+                };
+                let (ka, ta) = wrap1(a);
+                let (kz, tz) = wrap1(z);
+                (kz - ka) * total + anti(tz) - anti(ta)
+            },
+            _ => {
+                let (ca, cz) = (a.max(lo).min(hi), z.max(lo).min(hi));
+                let inside = anti(cz) - anti(ca);
+                let left = (lo.min(z) - a).max(0.0);
+                let right = (z - hi.max(a)).max(0.0);
+                let (vl, vr) = match self.mode {
+                    Extrapolate::Fill(v) => (v, v),
+                    _ => (self.piece(0, lo), self.piece(self.b.len() - 2, hi)),
+                };
+                inside + (if left > 0.0 { left * vl } else { 0.0 }) + (if right > 0.0 { right * vr } else { 0.0 })
+            },
+        }
+    }
+
+    /// The real `x` in `[b[0], b[n]]` where the polynomial equals `y`,
+    /// rising. A piece that is constant at `y` gives its left end only.
+    /// Each piece is split at the roots of its derivative (found the same
+    /// way, recursively), then each monotone part with a sign change is
+    /// solved by bisection and Newton steps to full precision.
+    ///
+    /// ```nabi
+    /// let s = try interpolate::cubic_spline([0, 1, 2, 3], [-1, 1, -1, 1]);
+    /// let r = s.solve(0.0);
+    /// assert(r.len() == 3 && (r[1] - 1.5).abs() < 1e-12);
+    /// ```
+    pub fn solve(self, y: f64 = 0.0) -> Vector<f64> {
+        let out: List<f64> = [];
+        let n = self.b.len() - 1;
+        let k = self.k;
+        let cs = List::filled(k + 1, 0.0);
+        for i in 0..n {
+            for j in 0..=k { cs[j] = self.c[i * (k + 1) + j]; }
+            cs[0] -= y;
+            let h = self.b[i + 1] - self.b[i];
+            let rs = pkg::ppoly::roots_in(cs, k, h);
+            for t in rs {
+                let x = self.b[i] + t;
+                // A root at a breakpoint shows in both pieces.
+                if out.len() > 0 && (x - out[out.len() - 1]).abs() <= 1e-12 * (1.0 + x.abs()) { continue; }
+                out.push(x);
+            }
+        }
+        vector(out)
+    }
+
+    /// The real roots in the domain, `solve(0.0)`.
+    ///
+    /// ```nabi
+    /// let s = try interpolate::cubic_spline([0, 1, 2], [1, -1, 1]);
+    /// assert(s.roots().len() == 2);
+    /// ```
+    pub fn roots(self) -> Vector<f64> { self.solve(0.0) }
+}
+
+impl Curve for PPoly {
+    fn at(self, x: f64) -> f64 {
+        let (lo, hi) = (self.b[0], self.b[self.b.len() - 1]);
+        let t = wrap(self.mode, x, lo, hi) ?? return fill(self.mode);
+        self.piece(interval(self.b, t), t)
+    }
+
+    fn eval<const N: usize>(self, xs: Array<f64, N>) -> Array<f64, N> {
+        let src = list(xs);
+        let out = List::filled(src.len(), 0.0);
+        let (lo, hi) = (self.b[0], self.b[self.b.len() - 1]);
+        let i = 0usize;
+        for m in 0..src.len() {
+            let t = wrap(self.mode, src[m], lo, hi) ?? f64::NAN;
+            if t.is_nan() && !src[m].is_nan() {
+                out[m] = fill(self.mode);
+                continue;
+            }
+            i = interval_from(self.b, t, i);
+            out[m] = self.piece(i, t);
+        }
+        Array::view_list(out, xs.shape())
+    }
+}
+
+/// The cubic Hermite piece coefficients for slopes `d` at `x`, `y`.
+pub(pkg) fn hermite(x: List<f64>, y: List<f64>, d: List<f64>) -> PPoly {
+    let n = x.len() - 1;
+    let c = List::filled(n * 4, 0.0);
+    for i in 0..n {
+        let h = x[i + 1] - x[i];
+        let s = (y[i + 1] - y[i]) / h;
+        c[4 * i] = y[i];
+        c[4 * i + 1] = d[i];
+        c[4 * i + 2] = (3.0 * s - 2.0 * d[i] - d[i + 1]) / h;
+        c[4 * i + 3] = (d[i] + d[i + 1] - 2.0 * s) / (h * h);
+    }
+    PPoly::raw(x.clone(), 3, c)
+}
+
+/// `sum_j c[j] t^j`.
+fn horner(c: List<f64>, k: usize, t: f64) -> f64 {
+    let s = c[k];
+    let j = k;
+    while j > 0 {
+        j -= 1;
+        s = s * t + c[j];
+    }
+    s
+}
+
+/// The real roots of `sum_j c[j] t^j` (degree <= k) in `[0, h]`, rising.
+pub(pkg) fn roots_in(c: List<f64>, k: usize, h: f64) -> List<f64> {
+    // Trim zero leading coefficients.
+    let d = k;
+    while d > 0 && c[d] == 0.0 { d -= 1; }
+    let out: List<f64> = [];
+    if d == 0 {
+        if c[0] == 0.0 { out.push(0.0); }
+        return out;
+    }
+    if d == 1 {
+        let t = -c[0] / c[1];
+        if t >= 0.0 && t <= h { out.push(t); }
+        return out;
+    }
+    // Monotone between the roots of the derivative.
+    let dc = List::filled(d, 0.0);
+    for j in 1..=d { dc[j - 1] = c[j] * (j as f64); }
+    let crit = roots_in(dc, d - 1, h);
+    let pts: List<f64> = [0.0];
+    for t in crit {
+        if t > pts[pts.len() - 1] && t < h { pts.push(t); }
+    }
+    pts.push(h);
+    let scale = 0.0;
+    for j in 0..=d { scale = scale.max(c[j].abs() * h.max(1.0).powi(j as i32)); }
+    let tiny = 64.0 * f64::EPSILON * scale;
+    for m in 0..pts.len() - 1 {
+        let (a, b) = (pts[m], pts[m + 1]);
+        let (fa, fb) = (horner(c, d, a), horner(c, d, b));
+        if fa == 0.0 || (m > 0 && fa.abs() <= tiny) {
+            if out.len() == 0 || out[out.len() - 1] < a { out.push(a); }
+            continue;
+        }
+        if fb == 0.0 { continue; }
+        if (fa < 0.0) == (fb < 0.0) { continue; }
+        out.push(bracket(c, d, a, b, fa));
+    }
+    let last = horner(c, d, h);
+    if last == 0.0 || (pts.len() > 2 && last.abs() <= tiny) {
+        if out.len() == 0 || out[out.len() - 1] < h { out.push(h); }
+    }
+    out
+}
+
+/// The root of a monotone polynomial in `[a, b]` with a sign change:
+/// Newton steps kept inside a shrinking bracket, bisection when one
+/// leaves it.
+fn bracket(c: List<f64>, d: usize, a: f64, b: f64, fa: f64) -> f64 {
+    let (lo, hi) = (a, b);
+    let neg_lo = fa < 0.0;
+    let t = 0.5 * (a + b);
+    for _ in 0..200 {
+        let f = horner(c, d, t);
+        if f == 0.0 { return t; }
+        if (f < 0.0) == neg_lo { lo = t; } else { hi = t; }
+        // f' by Horner on the fly.
+        let df = 0.0;
+        let j = d;
+        while j > 0 {
+            df = df * t + c[j] * (j as f64);
+            j -= 1;
+        }
+        let nt = if df != 0.0 { t - f / df } else { f64::NAN };
+        let next = if nt > lo && nt < hi { nt } else { 0.5 * (lo + hi) };
+        if next == t || hi - lo <= 2.0 * f64::EPSILON * t.abs().max(f64::MIN_POSITIVE) { return next; }
+        t = next;
+    }
+    t
+}

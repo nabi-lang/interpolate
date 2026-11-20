@@ -1,0 +1,227 @@
+// Integrals of sampled data: trapezoid, Simpson and Romberg rules, and
+// the running trapezoid integral. Sums are compensated (Neumaier), so
+// the rounding error does not grow with the sample count.
+
+use pkg::InterpError;
+use pkg::data::{arg, list, same, vector};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// A running sum with Neumaier's compensation: error O(eps) instead of
+/// O(n eps).
+pub(pkg) struct Acc {
+    s: f64;
+    c: f64;
+}
+
+impl Acc {
+    pub(pkg) fn new() -> Acc { Acc { s: 0.0, c: 0.0 } }
+
+    #[inline]
+    pub(pkg) fn add(ref self, v: f64) {
+        let t = self.s + v;
+        if self.s.abs() >= v.abs() { self.c += (self.s - t) + v; } else { self.c += (v - t) + self.s; }
+        self.s = t;
+    }
+
+    pub(pkg) fn get(self) -> f64 { self.s + self.c }
+}
+
+/// The sample positions of `x` for `n` values: the list itself, or
+/// `none` for a uniform step.
+fn positions(x: Vector<f64> | f64, n: usize) throws (InterpError) -> List<f64>? {
+    match x {
+        h: f64 => {
+            try arg(h.is_finite(), f"the step dx is {h}; pass a finite spacing");
+            none
+        },
+        v: Vector<f64> => {
+            let xs = list(v);
+            try same(n, xs.len(), "y", "x");
+            xs
+        },
+    }
+}
+
+fn step(x: Vector<f64> | f64) -> f64 {
+    match x {
+        h: f64 => h,
+        _ => 1.0,
+    }
+}
+
+/// The trapezoid rule for samples `y` at positions `x` (a vector of
+/// the same length, any order: a falling `x` gives the negative), or a
+/// uniform step `dx` (default 1). Exact for straight lines; error
+/// O(h^2 f''). Fewer than two samples give 0. O(n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [0, 1, 4, 9];
+/// assert(try interpolate::trapezoid(y) == 9.5);
+/// let x: Vector<f64> = [0, 1, 3, 4];
+/// assert(try interpolate::trapezoid(y, x) == 0.5 + 5.0 + 6.5);
+/// assert(try interpolate::trapezoid(y, 0.5) == 4.75);
+/// ```
+pub fn trapezoid(y: Vector<f64>, x: Vector<f64> | f64 = 1.0) throws (InterpError) -> f64 {
+    let ys = list(y);
+    let n = ys.len();
+    let xs = try positions(x, n);
+    if n < 2 { return 0.0; }
+    let acc = Acc::new();
+    match xs {
+        none => {
+            acc.add(0.5 * (ys[0] + ys[n - 1]));
+            for i in 1..n - 1 { acc.add(ys[i]); }
+            acc.get() * step(x)
+        },
+        p: List<f64> => {
+            for i in 0..n - 1 { acc.add(0.5 * (p[i + 1] - p[i]) * (ys[i] + ys[i + 1])); }
+            acc.get()
+        },
+    }
+}
+
+/// The running trapezoid integral: element `i` is the integral from
+/// `x[0]` to `x[i + 1]` (n - 1 values), or with `initial` given, from
+/// `x[0]` to `x[i]` plus `initial` (n values, the first `initial`).
+/// Spacing as `trapezoid`. O(n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [1, 1, 1];
+/// let c = try interpolate::cumulative_trapezoid(y, 0.5);
+/// assert(c.len() == 2 && c[1] == 1.0);
+/// let d = try interpolate::cumulative_trapezoid(y, initial: 0.0);
+/// assert(d.len() == 3 && d[0] == 0.0 && d[2] == 2.0);
+/// ```
+pub fn cumulative_trapezoid(y: Vector<f64>, x: Vector<f64> | f64 = 1.0, initial: f64? = none) throws (InterpError) -> Vector<f64> {
+    let ys = list(y);
+    let n = ys.len();
+    let xs = try positions(x, n);
+    let h = step(x);
+    let out: List<f64> = List::with_capacity(n);
+    let acc = Acc::new();
+    if let v = initial {
+        acc.add(v);
+        if n > 0 { out.push(v); }
+    }
+    for i in 0..(if n > 0 { n - 1 } else { 0 }) {
+        let w = match xs {
+            none => h,
+            p: List<f64> => p[i + 1] - p[i],
+        };
+        acc.add(0.5 * w * (ys[i] + ys[i + 1]));
+        out.push(acc.get());
+    }
+    vector(out)
+}
+
+/// Composite Simpson's rule for samples `y` at positions `x` or with a
+/// uniform step `dx` (default 1). An odd sample count uses Simpson on
+/// every pair of intervals: exact for cubics on a uniform grid, for
+/// quadratics on any grid, error O(h^4 f''''). An even count does the
+/// same on the first n - 2 intervals and integrates the parabola
+/// through the last three samples over the last interval (Cartwright's
+/// correction, as SciPy). Two samples give the trapezoid, fewer 0. O(n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [0, 1, 8, 27, 64];         // x^3 on 0..4
+/// assert(try interpolate::simpson(y) == 64.0);
+/// let x: Vector<f64> = [0, 1, 3];
+/// let q: Vector<f64> = [0, 1, 9];                  // x^2
+/// assert((try interpolate::simpson(q, x) - 9.0).abs() < 1e-14);
+/// ```
+pub fn simpson(y: Vector<f64>, x: Vector<f64> | f64 = 1.0) throws (InterpError) -> f64 {
+    let ys = list(y);
+    let n = ys.len();
+    let xs = try positions(x, n);
+    if n < 2 { return 0.0; }
+    if n == 2 { return try trapezoid(y, x); }
+    let h = step(x);
+    // Simpson pairs cover samples 0..=m.
+    let m = if n % 2 == 1 { n - 1 } else { n - 2 };
+    let acc = Acc::new();
+    match xs {
+        none => {
+            acc.add(ys[0] + ys[m]);
+            let i = 1usize;
+            while i < m {
+                acc.add(4.0 * ys[i]);
+                if i + 1 < m { acc.add(2.0 * ys[i + 1]); }
+                i += 2;
+            }
+            let s = acc.get() * h / 3.0;
+            if m == n - 1 { return s; }
+            s + h / 12.0 * (5.0 * ys[n - 1] + 8.0 * ys[n - 2] - ys[n - 3])
+        },
+        p: List<f64> => {
+            let i = 0usize;
+            while i < m {
+                let (h0, h1) = (p[i + 1] - p[i], p[i + 2] - p[i + 1]);
+                let hs = h0 + h1;
+                acc.add(hs / 6.0 * ((2.0 - h1 / h0) * ys[i] + hs * hs / (h0 * h1) * ys[i + 1] + (2.0 - h0 / h1) * ys[i + 2]));
+                i += 2;
+            }
+            if m == n - 1 { return acc.get(); }
+            let (h1, h2) = (p[n - 2] - p[n - 3], p[n - 1] - p[n - 2]);
+            let alpha = (2.0 * h2 * h2 + 3.0 * h1 * h2) / (6.0 * (h1 + h2));
+            let beta = (h2 * h2 + 3.0 * h1 * h2) / (6.0 * h1);
+            let eta = h2 * h2 * h2 / (6.0 * h1 * (h1 + h2));
+            acc.add(alpha * ys[n - 1] + beta * ys[n - 2] - eta * ys[n - 3]);
+            acc.get()
+        },
+    }
+}
+
+/// Romberg integration of `2^k + 1` uniform samples with step `dx`:
+/// trapezoid sums on the nested grids, extrapolated by Richardson's
+/// table to O(h^(2k + 2)). Exact for polynomials of degree 2k + 1. One
+/// sample gives 0. O(n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [0, 1, 16, 81, 256];       // x^4 on 0..4
+/// assert((try interpolate::romb(y) - 204.8).abs() < 1e-12);
+/// ```
+pub fn romb<Y: AsVector<f64>>(y: Y, dx: f64 = 1.0) throws (InterpError) -> f64 {
+    let y: Vector<f64> = y.as_vector();
+    let ys = list(y);
+    let n = ys.len();
+    let ok = n == 1 || (n >= 2 && ((n - 1) & (n - 2)) == 0);
+    try arg(ok, f"romb needs 2^k + 1 samples, got {n}; use `simpson` for any count");
+    try arg(dx.is_finite(), f"the step dx is {dx}; pass a finite spacing");
+    if n == 1 { return 0.0; }
+    let k = 0usize;
+    while (1usize << k) < n - 1 { k += 1; }
+    let r = List::filled(k + 1, 0.0);
+    let span = (n - 1) as f64 * dx;
+    r[0] = 0.5 * span * (ys[0] + ys[n - 1]);
+    for i in 1..=k {
+        // New midpoints of level i, every (n - 1) >> i samples.
+        let st = (n - 1) >> i;
+        let acc = Acc::new();
+        let j = st;
+        while j < n - 1 {
+            acc.add(ys[j]);
+            j += 2 * st;
+        }
+        let prev = r[0];
+        r[0] = 0.5 * prev + acc.get() * (st as f64) * dx;
+        // Richardson: r[m] = r[m-1] + (r[m-1] - old r[m-1]) / (4^m - 1).
+        let f = 1.0;
+        let last_old = prev;
+        for m in 1..=i {
+            f *= 4.0;
+            let keep = r[m];
+            r[m] = r[m - 1] + (r[m - 1] - last_old) / (f - 1.0);
+            last_old = keep;
+        }
+    }
+    r[k]
+}

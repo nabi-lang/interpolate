@@ -1,0 +1,80 @@
+// Gauss-Legendre rules: nodes by Newton's method on the Legendre
+// three-term recurrence from Tricomi's initial guess, weights from the
+// derivative, O(n^2) for n nodes, accurate to a few ulps.
+
+use pkg::InterpError;
+use pkg::data::vector;
+use core::array::Vector;
+use core::range::Range;
+
+/// The nodes and weights of the n-point Gauss-Legendre rule on [-1, 1],
+/// nodes rising. It integrates polynomials of degree up to 2n - 1
+/// exactly.
+///
+/// ```nabi
+/// let (x, w) = try interpolate::gauss_legendre(2);
+/// assert((x[1] - 1.0 / 3.0.sqrt()).abs() < 1e-15 && (w[0] - 1.0).abs() < 1e-15);
+/// ```
+pub fn gauss_legendre(n: usize) throws (InterpError) -> (Vector<f64>, Vector<f64>) {
+    if n < 1 { throw InterpError::BadArgument { what: "a Gauss rule needs n >= 1 nodes" }; }
+    let xs = List::filled(n, 0.0);
+    let ws = List::filled(n, 0.0);
+    let nf = n as f64;
+    // Roots come in +- pairs; find the positive ones.
+    for i in 0..(n + 1) / 2 {
+        let x = (f64::PI * (i as f64 + 0.75) / (nf + 0.5)).cos();
+        let dp = 0.0;
+        for _ in 0..100 {
+            let (p0, p1) = (1.0, x);
+            for k in 2..=n {
+                let kf = k as f64;
+                let p2 = ((2.0 * kf - 1.0) * x * p1 - (kf - 1.0) * p0) / kf;
+                p0 = p1;
+                p1 = p2;
+            }
+            let pn = if n == 1 { x } else { p1 };
+            let pm = if n == 1 { 1.0 } else { p0 };
+            dp = nf * (x * pn - pm) / (x * x - 1.0);
+            if n == 1 { dp = 1.0; }
+            let dx = pn / dp;
+            x -= dx;
+            if dx.abs() <= 4e-16 { break; }
+        }
+        // Weight from the converged node.
+        let (p0, p1) = (1.0, x);
+        for k in 2..=n {
+            let kf = k as f64;
+            let p2 = ((2.0 * kf - 1.0) * x * p1 - (kf - 1.0) * p0) / kf;
+            p0 = p1;
+            p1 = p2;
+        }
+        dp = if n == 1 { 1.0 } else { nf * (x * p1 - p0) / (x * x - 1.0) };
+        let w = 2.0 / ((1.0 - x * x) * dp * dp);
+        xs[n - 1 - i] = x;
+        xs[i] = -x;
+        ws[n - 1 - i] = w;
+        ws[i] = w;
+    }
+    if n % 2 == 1 { xs[n / 2] = 0.0; }
+    (vector(xs), vector(ws))
+}
+
+/// The integral of `f` over the finite range `r` by the n-point
+/// Gauss-Legendre rule (default 5): exact for polynomials of degree up
+/// to 2n - 1, n evaluations, no error estimate.
+///
+/// ```nabi
+/// let v = try interpolate::fixed_quad(|x: f64| -> f64 { x ** 5 }, 0.0..2.0, 3);
+/// assert((v - 64.0 / 6.0).abs() < 1e-13);
+/// ```
+pub fn fixed_quad(f: fn(f64) -> f64, r: Range<f64>, n: usize = 5) throws (InterpError) -> f64 {
+    let (a, b) = (r.start, r.end);
+    if !a.is_finite() || !b.is_finite() {
+        throw InterpError::BadArgument { what: f"fixed_quad needs a finite range, got {a}..{b}; use `quad` for an infinite one" };
+    }
+    let (x, w) = try gauss_legendre(n);
+    let (c, h) = (0.5 * (a + b), 0.5 * (b - a));
+    let s = 0.0;
+    for i in 0..n { s += w[i] * f(c + h * x[i]); }
+    s * h
+}

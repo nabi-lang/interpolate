@@ -1,0 +1,307 @@
+//! Radial basis function interpolation (Fasshauer, "Meshfree
+//! Approximation Methods with MATLAB", 2007): s(x) = sum_i c_i
+//! phi(eps |x - x_i|) + p(x) with p a polynomial of low degree, the
+//! coefficients from the saddle-point system [K + lambda I, P; P^T, 0]
+//! [c; d] = [y; 0] solved by LU with partial pivoting. The polynomial
+//! is built on coordinates shifted and scaled to [-1, 1] per axis.
+//! Fit O(n^3), evaluation O(n) per point.
+
+use pkg::InterpError;
+use pkg::data::{arg, enough, finite, list, same};
+use bare::mem::GcBuf;
+use core::array::{Array, Matrix, Vector};
+
+// From this many query points evaluation runs across the workers.
+const PAR: usize = 256;
+const CHUNK: usize = 64;
+
+/// The radial function `phi(r)` of an `Rbf`, applied to `eps * r`.
+///
+/// ```nabi
+/// use interpolate::scatter::Kernel;
+///
+/// assert(Kernel::ThinPlate.phi(1.0) == 0.0);
+/// assert(Kernel::Gaussian.phi(0.0) == 1.0);
+/// assert(Kernel::ThinPlate.min_degree() == 1);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kernel {
+    /// `-r`, conditionally positive definite of order 1.
+    Linear,
+    /// `r^2 ln r`, the thin-plate spline: minimal bending energy in 2-d.
+    ThinPlate,
+    /// `r^3`.
+    Cubic,
+    /// `-r^5`.
+    Quintic,
+    /// `-sqrt(1 + r^2)`.
+    Multiquadric,
+    /// `1 / sqrt(1 + r^2)`.
+    InverseMultiquadric,
+    /// `1 / (1 + r^2)`.
+    InverseQuadratic,
+    /// `exp(-r^2)`.
+    Gaussian,
+}
+
+impl Kernel {
+    /// `phi(r)`.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::Kernel;
+    ///
+    /// assert(Kernel::Cubic.phi(2.0) == 8.0);
+    /// ```
+    pub fn phi(self, r: f64) -> f64 {
+        match self {
+            Kernel::Linear => -r,
+            Kernel::ThinPlate => if r == 0.0 { 0.0 } else { r * r * r.ln() },
+            Kernel::Cubic => r * r * r,
+            Kernel::Quintic => -(r * r) * (r * r) * r,
+            Kernel::Multiquadric => -(1.0 + r * r).sqrt(),
+            Kernel::InverseMultiquadric => 1.0 / (1.0 + r * r).sqrt(),
+            Kernel::InverseQuadratic => 1.0 / (1.0 + r * r),
+            Kernel::Gaussian => (-(r * r)).exp(),
+        }
+    }
+
+    /// The lowest polynomial degree that makes the system uniquely
+    /// solvable for distinct points (-1: none needed).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::Kernel;
+    ///
+    /// assert(Kernel::Quintic.min_degree() == 2 && Kernel::Gaussian.min_degree() == -1);
+    /// ```
+    pub fn min_degree(self) -> i64 {
+        match self {
+            Kernel::Linear => 0,
+            Kernel::ThinPlate => 1,
+            Kernel::Cubic => 1,
+            Kernel::Quintic => 2,
+            Kernel::Multiquadric => 0,
+            _ => -1,
+        }
+    }
+}
+
+/// A radial basis function interpolant of scattered data in any
+/// dimension. `smoothing > 0` trades exactness for a smoother fit
+/// (ridge on the kernel part); with a polynomial of degree >= 1,
+/// linear data comes back exactly whatever the kernel. Call it at a
+/// point, `f([x, y])`.
+///
+/// ```nabi
+/// use interpolate::scatter::{Kernel, Rbf};
+/// use core::array::Matrix;
+///
+/// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [1, 1], [0.5, 0.5]];
+/// let f = try Rbf::new(p, [0, 1, 1, 2, 1.5]);           // thin plate, degree 1
+/// assert((f([0.5, 0.5]) - 1.5).abs() < 1e-12);
+/// let g = try Rbf::new(p, [0, 1, 1, 2, 1.5], kernel: Kernel::Gaussian, epsilon: 2.0);
+/// assert((g([1.0, 0.0]) - 1.0).abs() < 1e-12);
+/// ```
+#[derive(Clone)]
+pub struct Rbf {
+    n: usize;
+    d: usize;
+    kernel: Kernel;
+    eps: f64;
+    centers: GcBuf<f64>;
+    coef: GcBuf<f64>;
+    // Monomial m has exponents pow[m * d + k]; poly holds its weights.
+    q: usize;
+    pow: GcBuf<usize>;
+    poly: GcBuf<f64>;
+    shift: GcBuf<f64>;
+    scale: GcBuf<f64>;
+}
+
+fn buf<T>(n: usize) -> GcBuf<T> { unsafe { GcBuf::new(n + 1) } }
+
+/// Every exponent tuple of length `d` with sum <= `deg`.
+fn monomials(d: usize, deg: i64) -> List<usize> {
+    let out: List<usize> = [];
+    if deg < 0 { return out; }
+    let cur = List::filled(d, 0usize);
+    walk(d, 0, deg as usize, cur, out);
+    out
+}
+
+fn walk(d: usize, k: usize, left: usize, cur: List<usize>, out: List<usize>) {
+    if k == d {
+        for v in cur { out.push(v); }
+        return;
+    }
+    for e in 0..=left {
+        cur[k] = e;
+        walk(d, k + 1, left - e, cur, out);
+    }
+    cur[k] = 0;
+}
+
+impl Rbf {
+    /// The interpolant of `values[i]` at row `i` of `points` (n x d).
+    /// `degree` defaults to the larger of 1 and `kernel.min_degree()`;
+    /// pass -1 for no polynomial. `epsilon` scales distances (it
+    /// matters for the multiquadrics and the Gaussian; the others are
+    /// scale-free up to the polynomial).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::{Kernel, Rbf};
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0], [1], [2], [3]];
+    /// let f = try Rbf::new(p, [0, 1, 4, 9], kernel: Kernel::Cubic, smoothing: 0.0);
+    /// assert((f.at([2.0]) - 4.0).abs() < 1e-12);
+    /// ```
+    pub fn new(points: Matrix<f64>, values: Vector<f64>, kernel: Kernel = Kernel::ThinPlate, epsilon: f64 = 1.0, smoothing: f64 = 0.0, degree: i64? = none) throws (InterpError) -> Rbf {
+        let s = points.shape();
+        let (n, d) = (s[0], s[1]);
+        try arg(d >= 1, "points need at least one column");
+        let v = list(values);
+        try same(n, v.len(), "points", "values");
+        let src = list(points);
+        try finite(src, "points");
+        try finite(v, "values");
+        try arg(epsilon > 0.0 && epsilon.is_finite(), f"epsilon {epsilon} must be positive and finite");
+        try arg(smoothing >= 0.0 && smoothing.is_finite(), f"smoothing {smoothing} must be >= 0");
+        let md = kernel.min_degree();
+        let deg = degree ?? md.max(1);
+        try arg(deg >= md, f"degree {deg} is below {md}, the least {kernel:?} needs for a solvable system; pass degree: {md} or more");
+        let pow = monomials(d, deg);
+        let q = pow.len() / d;
+        try enough(n, q.max(1));
+        // Per-axis center and half-width for the polynomial.
+        let shift = List::filled(d, 0.0);
+        let scale = List::filled(d, 1.0);
+        for k in 0..d {
+            let (lo, hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for i in 0..n {
+                lo = lo.min(src[i * d + k]);
+                hi = hi.max(src[i * d + k]);
+            }
+            shift[k] = 0.5 * (lo + hi);
+            if hi > lo { scale[k] = 0.5 * (hi - lo); }
+        }
+        let m = n + q;
+        let a = List::filled(m * m, 0.0);
+        for i in 0..n {
+            for j in 0..=i {
+                let r2 = 0.0;
+                for k in 0..d {
+                    let t = src[i * d + k] - src[j * d + k];
+                    r2 += t * t;
+                }
+                let phi = kernel.phi(epsilon * r2.sqrt());
+                a[i * m + j] = phi;
+                a[j * m + i] = phi;
+            }
+            a[i * m + i] += smoothing;
+            for t in 0..q {
+                let p = 1.0;
+                for k in 0..d { p *= ((src[i * d + k] - shift[k]) / scale[k]).powi(pow[t * d + k] as i32); }
+                a[i * m + n + t] = p;
+                a[(n + t) * m + i] = p;
+            }
+        }
+        let rhs = List::filled(m, 0.0);
+        for i in 0..n { rhs[i] = v[i]; }
+        let am: Matrix<f64> = Array::view_list(a, [m, m]);
+        let x = try linalg::solve(am, Array::from(rhs)) catch _: linalg::LinalgError {
+            throw InterpError::Singular { what: "the RBF system (repeated points, or too few points off a line or plane for the polynomial degree); remove duplicates, add smoothing, or lower `degree`" };
+        };
+        let r = Rbf {
+            n, d, kernel, eps: epsilon,
+            centers: buf(n * d), coef: buf(n), q, pow: buf(q * d), poly: buf(q), shift: buf(d), scale: buf(d),
+        };
+        unsafe {
+            for i in 0..n * d { r.centers.set(i, src[i]); }
+            for i in 0..n { r.coef.set(i, x[i]); }
+            for t in 0..q { r.poly.set(t, x[n + t]); }
+            for i in 0..q * d { r.pow.set(i, pow[i]); }
+            for k in 0..d {
+                r.shift.set(k, shift[k]);
+                r.scale.set(k, scale[k]);
+            }
+        }
+        r
+    }
+
+    /// The fitted value at `x`, given as `x[o..o + d]` of a buffer.
+    fn value(self, x: GcBuf<f64>, o: usize) -> f64 {
+        let (n, d) = (self.n, self.d);
+        let s = 0.0;
+        unsafe {
+            for i in 0..n {
+                let r2 = 0.0;
+                for k in 0..d {
+                    let t = x.get(o + k) - self.centers.get(i * d + k);
+                    r2 += t * t;
+                }
+                s += self.coef.get(i) * self.kernel.phi(self.eps * r2.sqrt());
+            }
+            for t in 0..self.q {
+                let p = self.poly.get(t);
+                for k in 0..d { p *= ((x.get(o + k) - self.shift.get(k)) / self.scale.get(k)).powi(self.pow.get(t * d + k) as i32); }
+                s += p;
+            }
+        }
+        s
+    }
+
+    /// The value at `x` (d coordinates); NaN for the wrong length.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::Rbf;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// let f = try Rbf::new(p, [1, 2, 3]);              // the plane 1 + x + 2y
+    /// assert((f.at([0.5, 0.5]) - 2.5).abs() < 1e-12);
+    /// ```
+    pub fn at(self, x: Vector<f64>) -> f64 {
+        if x.len() != self.d { return f64::NAN; }
+        let b: GcBuf<f64> = buf(self.d);
+        unsafe { for k in 0..self.d { b.set(k, x[k]); } }
+        self.value(b, 0)
+    }
+
+    /// The value at every row of `xs` (m x d); 256 rows and more run
+    /// across the workers.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::Rbf;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0], [1], [2]];
+    /// let f = try Rbf::new(p, [0, 1, 0]);
+    /// let v = try f.eval(p);
+    /// assert((v[1] - 1.0).abs() < 1e-12);
+    /// ```
+    pub fn eval(self, xs: Matrix<f64>) throws (InterpError) -> Vector<f64> {
+        let s = xs.shape();
+        try arg(s[1] == self.d, f"query points have {s[1]} columns, the data {self.d}");
+        let (m, d) = (s[0], self.d);
+        let src = list(xs);
+        let b: GcBuf<f64> = buf(m * d);
+        unsafe { for i in 0..m * d { b.set(i, src[i]); } }
+        let out: GcBuf<f64> = buf(m);
+        let me = self;
+        let run = |c: usize| {
+            for r in (c * CHUNK)..m.min((c + 1) * CHUNK) {
+                unsafe { out.set(r, me.value(b, r * d)); }
+            }
+        };
+        let chunks = (m + CHUNK - 1) / CHUNK;
+        if m >= PAR { par::for_each(0..chunks, run); } else { for c in 0..chunks { run(c); } }
+        let res = List::filled(m, 0.0);
+        unsafe { for i in 0..m { res[i] = out.get(i); } }
+        Array::from(res)
+    }
+}
+
+impl ops::Call<Vector<f64>> for Rbf {
+    type Output = f64;
+    fn call(self, p: Vector<f64>) -> f64 { self.at(p) }
+}

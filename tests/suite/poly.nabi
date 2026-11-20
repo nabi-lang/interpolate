@@ -1,0 +1,177 @@
+use pkg::tests::suite::{close, expect, linspace, rel, throws_kind, uniform};
+use pkg::{Chebyshev, Curve, Polynomial};
+use core::array::Vector;
+
+fn p(c: List<f64>) -> Polynomial { Polynomial::new(Vector::<f64>::from(c)) }
+
+#[test]
+fn horner_and_display() {
+    let q = p([1.0, -3.0, 0.0, 2.0]);
+    expect(q.at(2.0) == 11.0 && q.at(0.0) == 1.0 && q.at(-1.0) == 2.0, "horner");
+    expect(q.degree() == 3, "degree");
+    expect(f"{q}" == "1 - 3x + 2x^3", f"display {q}");
+    expect(f"{p([0.0, 0.0])}" == "0", "zero");
+    expect(f"{p([0.0, -1.0, 1.5])}" == "-x + 1.5x^2", f"{p([0.0, -1.0, 1.5])}");
+    let ys = q.eval(Vector::<f64>::from([0.0, 1.0, 2.0]));
+    expect(ys[2] == 11.0 && ys[1] == 0.0, "eval");
+    expect(p([1.0, 2.0, 0.0, 0.0]) == p([1.0, 2.0]), "trailing zeros");
+}
+
+#[test]
+fn operators() {
+    let x = Polynomial::x();
+    let a = p([1.0, 1.0]);
+    let b = p([0.0, 2.0]);
+    let c = p([3.0, 0.0, 1.0]);
+    // `*` binds tighter than `+`.
+    expect(a + b * c == a + (b * c), "a + b * c");
+    expect(a + b * c == p([1.0, 7.0, 0.0, 2.0]), f"{a + b * c}");
+    // `**` binds tighter than prefix `-`.
+    expect(-a ** 2 == -(a * a), "-a ** 2");
+    expect((-a) ** 2 == a * a, "(-a) ** 2");
+    expect(a ** 0 == Polynomial::constant(1.0) && a ** 5 == a * a * a * a * a, "pow");
+    expect(2.0 * a == a * 2.0 && 2.0 * a == p([2.0, 2.0]), "scalar left");
+    expect(1.0 - x == p([1.0, -1.0]) && x - 1.0 == p([-1.0, 1.0]) && 1.0 + x == x + 1.0, "scalar add/sub");
+    expect((x * x + 1.0) / 2.0 == p([0.5, 0.0, 0.5]), "div by scalar");
+    // Composition is left associative and means p(q(r(x))).
+    let r = p([0.5, -1.0]);
+    let pqr = c ∘ a ∘ r;
+    expect(pqr == (c ∘ a) ∘ r, "left assoc");
+    for t in [-1.5, 0.0, 0.3, 2.0] {
+        close(pqr.at(t), c.at(a.at(r.at(t))), 1e-12, "p(q(r(x)))");
+    }
+    // `∘` binds tighter than `*` (level 11 against 10), looser than `**`.
+    expect(c ∘ a * b == (c ∘ a) * b, "∘ vs *");
+    expect(c ∘ a ** 2 == c ∘ (a * a), "∘ vs **");
+    expect(a ∘ x == a && x ∘ a == a, "identity");
+}
+
+#[test]
+fn division() {
+    let n = p([5.0, -2.0, 0.0, 3.0, 1.0]);
+    let d = p([1.0, 0.0, 2.0]);
+    let (q, r) = try! n.divmod(d);
+    expect(r.degree() < d.degree(), "deg r < deg d");
+    let back = q * d + r;
+    for i in 0..5 { close(back.coef(i), n.coef(i), 1e-14, "p = q d + r"); }
+    expect(n / d == q && n % d == r, "/ and %");
+    expect(throws_kind(|| { _ = try n.divmod(p([0.0])); }, "BadArgument"), "zero divisor");
+    let (q2, r2) = try! d.divmod(n);
+    expect(q2.is_zero() && r2 == d, "low over high");
+}
+
+#[test]
+fn calculus() {
+    let q = p([1.0, 2.0, 3.0, 4.0]);
+    expect(q.deriv(1) == p([2.0, 6.0, 12.0]), "deriv");
+    expect(q.deriv(2) == p([6.0, 24.0]), "deriv 2");
+    expect(q.integ(1).deriv(1) == q, "integ then deriv");
+    expect(q.integ(2, 1.0).at(0.0) == 1.0, "constant");
+    close(q.integrate(0.0..1.0), 1.0 + 1.0 + 1.0 + 1.0, 1e-15, "definite");
+    close(q.integrate(1.0..0.0), -4.0, 1e-15, "reversed");
+}
+
+#[test]
+fn roots_known() {
+    // (x - 1)(x - 2)(x + 3)
+    let r = try! Polynomial::from_roots(Vector::<f64>::from([1.0, 2.0, -3.0])).real_roots();
+    expect(r.len() == 3, "three");
+    close(r[0], -3.0, 1e-14, "r0");
+    close(r[1], 1.0, 1e-14, "r1");
+    close(r[2], 2.0, 1e-14, "r2");
+    // x^2 + 2x + 5: -1 +- 2i.
+    let z = try! p([5.0, 2.0, 1.0]).roots();
+    expect(z.len() == 2, "pair");
+    close(z[0].re, -1.0, 1e-14, "re");
+    close(z[0].im.abs(), 2.0, 1e-14, "im");
+    expect(z[0].im == -z[1].im, "conjugates");
+    expect((try! p([5.0, 2.0, 1.0]).real_roots()).len() == 0, "no real");
+    // Zero roots split off.
+    let z0 = try! p([0.0, 0.0, -1.0, 1.0]).real_roots();
+    expect(z0.len() == 3 && z0[0] == 0.0 && z0[1] == 0.0 && z0[2] == 1.0, f"{z0:?}");
+    expect((try! p([4.0]).roots()).len() == 0, "constant");
+}
+
+#[test]
+fn roots_wilkinson() {
+    // Wilkinson's polynomial of degree 12: the roots are notoriously
+    // ill conditioned in the power basis (condition up to ~1e6 here), so
+    // 1e-6 relative is what the coefficients themselves allow.
+    let rs: List<f64> = [];
+    for k in 1..=12 { rs.push(k as f64); }
+    let w = Polynomial::from_roots(Vector::<f64>::from(rs));
+    let r = try! w.real_roots();
+    expect(r.len() == 12, f"{r.len()} real roots");
+    for k in 0..12 { rel(r[k], (k + 1) as f64, 1e-6, f"root {k + 1}"); }
+}
+
+#[test]
+fn fit_exact() {
+    let x = linspace(-2.0, 5.0, 12);
+    let q = p([0.5, -1.0, 0.25, 0.125]);
+    let y = q.eval(x);
+    let f = try! Polynomial::fit(x, y, 3);
+    for i in 0..4 { close(f.coef(i), q.coef(i), 1e-12, f"coef {i}"); }
+    // Noise-free data on a shifted interval, higher degree than needed.
+    let x2 = linspace(100.0, 101.0, 20);
+    let g = try! Polynomial::fit(x2, q.eval(x2), 5);
+    for t in [100.0, 100.4, 101.0] { rel(g.at(t), q.at(t), 1e-9, "shifted"); }
+    expect(throws_kind(|| { _ = try Polynomial::fit(Vector::<f64>::from([1.0, 2.0]), Vector::<f64>::from([1.0, 2.0]), 2); }, "TooFewPoints"), "too few");
+    expect(throws_kind(|| { _ = try Polynomial::fit(Vector::<f64>::from([1.0, 2.0]), Vector::<f64>::from([1.0]), 1); }, "LengthMismatch"), "mismatch");
+}
+
+#[test]
+fn chebyshev_interpolation() {
+    let c = Chebyshev::interpolate(f64::exp, 20, -1.0..2.0);
+    let worst = 0.0;
+    for t in linspace(-1.0, 2.0, 101) { worst = worst.max((c.at(t) - t.exp()).abs() / t.exp()); }
+    // The cosine sum rounds to about n eps max|f|.
+    expect(worst < 50.0 * 2.2e-16, f"exp error {worst}");
+    // Runge's function: equispaced interpolation diverges, Chebyshev
+    // points converge geometrically.
+    let runge = |x: f64| -> f64 { 1.0 / (1.0 + 25.0 * x * x) };
+    let r = Chebyshev::interpolate(runge, 250, -1.0..1.0);
+    let worst = 0.0;
+    for t in linspace(-1.0, 1.0, 1001) { worst = worst.max((r.at(t) - runge(t)).abs()); }
+    expect(worst < 5e-14, f"runge error {worst}");      // n eps
+    close(r.integrate(), 0.4 * 5f64.atan(), 1e-14, "runge integral");
+}
+
+#[test]
+fn chebyshev_calculus_roots() {
+    let c = Chebyshev::interpolate(f64::sin, 30, 0.0..7.0);
+    for t in [0.5, 3.0, 6.5] {
+        close(c.deriv(1).at(t), t.cos(), 1e-12, "deriv");
+        close(c.deriv(2).at(t), -t.sin(), 1e-10, "deriv 2");
+        close(c.integ(1).at(t), 1.0 - t.cos(), 1e-14, "integ");
+    }
+    let r = try! c.roots();
+    expect(r.len() == 3, f"{r:?}");
+    close(r[0], 0.0, 1e-13, "0");
+    close(r[1], f64::PI, 1e-13, "pi");
+    close(r[2], 2.0 * f64::PI, 1e-13, "2 pi");
+    let q = c.to_polynomial();
+    close(q.at(1.0), 1f64.sin(), 1e-9, "to_polynomial");
+    // T_m T_n = (T_{m+n} + T_{|m-n|}) / 2, and the operators agree with
+    // pointwise arithmetic.
+    let a = try! Chebyshev::new(Vector::<f64>::from([1.0, 2.0, -1.0]), 0.0..7.0);
+    let s = a * c + 2.0 * a - c;
+    for t in [0.1, 2.0, 6.9] { close(s.at(t), a.at(t) * c.at(t) + 2.0 * a.at(t) - c.at(t), 1e-13, "ops"); }
+    let f = try! Chebyshev::fit(linspace(0.0, 7.0, 40), a.eval(linspace(0.0, 7.0, 40)), 2);
+    for k in 0..3 { close(f.coefficients()[k], a.coefficients()[k], 1e-13, "fit"); }
+    expect(throws_kind(|| { _ = try Chebyshev::new(Vector::<f64>::from([1.0]), 1.0..1.0); }, "BadArgument"), "empty domain");
+}
+
+#[test]
+fn random_roots_property() {
+    // Roots of random cubics with well separated real roots come back.
+    for seed in 0u64..20 {
+        let r = uniform(3, -5.0, 5.0, seed + 100).to_list();
+        r.sort_by(|a: f64, b: f64| a.total_cmp(b));
+        if r[1] - r[0] < 0.1 || r[2] - r[1] < 0.1 { continue; }
+        let q = Polynomial::from_roots(Vector::<f64>::from(r));
+        let got = try! q.real_roots();
+        expect(got.len() == 3, "three roots");
+        for k in 0..3 { close(got[k], r[k], 1e-11, f"seed {seed} root {k}"); }
+    }
+}

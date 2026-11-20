@@ -1,0 +1,209 @@
+// Cubic interpolating splines: C2 piecewise cubics through the data,
+// from one tridiagonal system in the slopes (de Boor, "A Practical
+// Guide to Splines", ch. IV), solved by banded LU in O(n).
+
+use pkg::banded::Band;
+use pkg::data::{arg, pairs};
+use pkg::ppoly::hermite;
+use pkg::{InterpError, PPoly};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// The end conditions of a cubic spline.
+///
+/// ```nabi
+/// use interpolate::{Boundary, Curve};
+///
+/// let s = try interpolate::cubic_spline_with([0, 1, 2], [0, 1, 0], Boundary::Natural);
+/// assert(s.derivative(2).at(0.0).abs() < 1e-14);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Boundary {
+    /// The first two and last two pieces are one cubic (third derivative
+    /// continuous at `x[1]` and `x[n - 2]`); the default. Exact for
+    /// cubics.
+    NotAKnot,
+    /// Zero second derivative at both ends.
+    Natural,
+    /// Zero slope at both ends.
+    Clamped,
+    /// The given first derivatives at the start and the end.
+    Slopes(f64, f64),
+    /// The given second derivatives at the start and the end.
+    Curvatures(f64, f64),
+    /// Periodic: value, slope and curvature match at both ends; needs
+    /// `y[0] == y[n - 1]`.
+    Periodic,
+}
+
+/// The not-a-knot cubic spline through the samples (at least 2; 2
+/// points give the line, 3 the parabola). Error `5 h^4 max|f''''| / 384`
+/// for smooth `f`; exact for cubics.
+///
+/// ```nabi
+/// use interpolate::Curve;
+///
+/// let s = try interpolate::cubic_spline([0, 1, 2, 3, 4], [0, 1, 8, 27, 64]);
+/// assert((s.at(2.5) - 15.625).abs() < 1e-12);
+/// ```
+pub fn cubic_spline<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y) throws (InterpError) -> PPoly {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    try cubic_spline_with(x, y, Boundary::NotAKnot)
+}
+
+/// The cubic spline with end conditions `bc` (see `Boundary`).
+///
+/// ```nabi
+/// use interpolate::{Boundary, Curve, Extrapolate};
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0, 1, 2, 3];
+/// let s = try interpolate::cubic_spline_with(x, [0, 1, 0, 0], Boundary::Periodic);
+/// let p = s.extrapolate(Extrapolate::Periodic);
+/// assert((p.at(3.5) - p.at(0.5)).abs() < 1e-15);
+/// assert((s.derivative(1).at(0.0) - s.derivative(1).at(3.0)).abs() < 1e-14);
+/// ```
+pub fn cubic_spline_with<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, bc: Boundary) throws (InterpError) -> PPoly {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let (xs, ys) = try pairs(x, y, 2);
+    let n = xs.len();
+    let dx = List::filled(n - 1, 0.0);
+    let m = List::filled(n - 1, 0.0);
+    for i in 0..n - 1 {
+        dx[i] = xs[i + 1] - xs[i];
+        m[i] = (ys[i + 1] - ys[i]) / dx[i];
+    }
+    if bc == Boundary::Periodic { return try periodic(xs, ys, dx, m); }
+    let (start, end) = match bc {
+        Boundary::Natural => (End::Curv(0.0), End::Curv(0.0)),
+        Boundary::Clamped => (End::Slope(0.0), End::Slope(0.0)),
+        Boundary::Slopes(a, b) => (End::Slope(a), End::Slope(b)),
+        Boundary::Curvatures(a, b) => (End::Curv(a), End::Curv(b)),
+        _ => (End::Knot, End::Knot),
+    };
+    if n == 2 && (start == End::Knot || end == End::Knot) {
+        // A line: both ends take the one secant.
+        let d = List::filled(2, m[0]);
+        return hermite(xs, ys, d);
+    }
+    if n == 3 && start == End::Knot && end == End::Knot {
+        // One parabola through the three points.
+        let (h0, h1) = (dx[0], dx[1]);
+        let c = (m[1] - m[0]) / (h0 + h1);
+        let d = List::filled(3, 0.0);
+        d[0] = m[0] - c * h0;
+        d[1] = m[0] + c * h0;
+        d[2] = m[1] + c * h1;
+        return hermite(xs, ys, d);
+    }
+    let a = Band::new(n, 1, 1);
+    let b = List::filled(n, 0.0);
+    for i in 1..n - 1 {
+        a.set(i, i - 1, dx[i]);
+        a.set(i, i, 2.0 * (dx[i - 1] + dx[i]));
+        a.set(i, i + 1, dx[i - 1]);
+        b[i] = 3.0 * (dx[i] * m[i - 1] + dx[i - 1] * m[i]);
+    }
+    match start {
+        End::Knot => {
+            let d = xs[2] - xs[0];
+            a.set(0, 0, dx[1]);
+            a.set(0, 1, d);
+            b[0] = ((dx[0] + 2.0 * d) * dx[1] * m[0] + dx[0] * dx[0] * m[1]) / d;
+        },
+        End::Slope(v) => {
+            a.set(0, 0, 1.0);
+            b[0] = v;
+        },
+        End::Curv(v) => {
+            a.set(0, 0, 2.0);
+            a.set(0, 1, 1.0);
+            b[0] = 3.0 * m[0] - 0.5 * v * dx[0];
+        },
+    }
+    match end {
+        End::Knot => {
+            let d = xs[n - 1] - xs[n - 3];
+            a.set(n - 1, n - 1, dx[n - 3]);
+            a.set(n - 1, n - 2, d);
+            b[n - 1] = (dx[n - 2] * dx[n - 2] * m[n - 3] + (2.0 * d + dx[n - 2]) * dx[n - 3] * m[n - 2]) / d;
+        },
+        End::Slope(v) => {
+            a.set(n - 1, n - 1, 1.0);
+            b[n - 1] = v;
+        },
+        End::Curv(v) => {
+            a.set(n - 1, n - 1, 2.0);
+            a.set(n - 1, n - 2, 1.0);
+            b[n - 1] = 3.0 * m[n - 2] + 0.5 * v * dx[n - 2];
+        },
+    }
+    try a.factor("cubic spline end conditions");
+    a.solve(b, 0, 1);
+    hermite(xs, ys, b)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum End {
+    Knot,
+    Slope(f64),
+    Curv(f64),
+}
+
+/// The periodic spline: a cyclic tridiagonal system in the slopes
+/// `s[0..n - 1]` (`s[n - 1] = s[0]`), solved by Sherman-Morrison on top
+/// of the banded LU.
+fn periodic(xs: List<f64>, ys: List<f64>, dx: List<f64>, m: List<f64>) throws (InterpError) -> PPoly {
+    let n = xs.len();
+    let scale = ys[0].abs().max(ys[n - 1].abs()).max(f64::MIN_POSITIVE);
+    try arg((ys[0] - ys[n - 1]).abs() <= 1e-12 * scale, f"a periodic spline needs y[0] == y[n - 1], got {ys[0]} and {ys[n - 1]}; set the last value to the first");
+    let k = n - 1;
+    let s = List::filled(n, 0.0);
+    if k == 1 {
+        return hermite(xs, ys, s);
+    }
+    // Row i: dx[i] s[i - 1] + 2 (dx[i - 1] + dx[i]) s[i] + dx[i - 1] s[i + 1]
+    // with indices mod k and dx[-1] = dx[k - 1].
+    let rhs = List::filled(k, 0.0);
+    for i in 0..k {
+        let p = if i == 0 { k - 1 } else { i - 1 };
+        rhs[i] = 3.0 * (dx[i] * m[p] + dx[p] * m[i]);
+    }
+    if k == 2 {
+        // Both off-diagonal terms land in one column.
+        let a00 = 2.0 * (dx[1] + dx[0]);
+        let a01 = dx[0] + dx[1];
+        let det = a00 * a00 - a01 * a01;
+        s[0] = (rhs[0] * a00 - a01 * rhs[1]) / det;
+        s[1] = (a00 * rhs[1] - a01 * rhs[0]) / det;
+        s[2] = s[0];
+        return hermite(xs, ys, s);
+    }
+    let alpha = dx[0];          // row 0, column k - 1
+    let beta = dx[k - 2];       // row k - 1, column 0
+    let d0 = 2.0 * (dx[k - 1] + dx[0]);
+    let gamma = -d0;
+    let t = Band::new(k, 1, 1);
+    for i in 0..k {
+        let p = if i == 0 { k - 1 } else { i - 1 };
+        t.set(i, i, 2.0 * (dx[p] + dx[i]));
+        if i > 0 { t.set(i, i - 1, dx[i]); }
+        if i + 1 < k { t.set(i, i + 1, dx[p]); }
+    }
+    t.set(0, 0, d0 - gamma);
+    t.set(k - 1, k - 1, 2.0 * (dx[k - 2] + dx[k - 1]) - alpha * beta / gamma);
+    try t.factor("periodic spline");
+    let u = List::filled(k, 0.0);
+    u[0] = gamma;
+    u[k - 1] = beta;
+    t.solve(rhs, 0, 1);
+    t.solve(u, 0, 1);
+    let vy = rhs[0] + alpha / gamma * rhs[k - 1];
+    let vz = u[0] + alpha / gamma * u[k - 1];
+    let f = vy / (1.0 + vz);
+    for i in 0..k { s[i] = rhs[i] - f * u[i]; }
+    s[k] = s[0];
+    hermite(xs, ys, s)
+}

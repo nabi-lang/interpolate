@@ -1,0 +1,258 @@
+//! Interpolants of scattered data: piecewise linear on the Delaunay
+//! triangulation (2-d) and nearest neighbor through a k-d tree (any d).
+
+use pkg::InterpError;
+use pkg::data::{arg, finite, list, same};
+use pkg::scatter::kdtree::{Heap, Stack};
+use pkg::scatter::{Delaunay, KdTree};
+use core::array::{Array, Matrix, Vector};
+
+/// Piecewise-linear interpolation of 2-d scattered data: inside each
+/// Delaunay triangle the plane through its three values (barycentric
+/// weights), so linear functions come back exactly (to rounding).
+/// Outside the convex hull it gives `fill` (NaN unless set). A query
+/// finds its triangle by a walk that starts at the triangle of the
+/// nearest vertex (k-d tree), O(log n) per point.
+///
+/// ```nabi
+/// use interpolate::scatter::LinearND;
+/// use core::array::Matrix;
+///
+/// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [1, 1]];
+/// let f = try LinearND::new(p, [0, 1, 2, 3]);     // 1 x + 2 y
+/// assert((f([0.5, 0.25]) - 1.0).abs() < 1e-15);
+/// assert(f([2.0, 0.0]).is_nan());
+/// assert(f.fill(0.0).at([2.0, 0.0]) == 0.0);
+/// ```
+#[derive(Clone)]
+pub struct LinearND {
+    tri: Delaunay;
+    tree: KdTree;
+    v: List<f64>;
+    fill: f64;
+}
+
+impl LinearND {
+    /// The interpolant of `values[i]` at row `i` of `points` (n x 2).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::LinearND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [2, 0], [0, 2]];
+    /// assert((try LinearND::new(p, [1, 1, 1])).at([0.5, 0.5]) == 1.0);
+    /// ```
+    pub fn new(points: Matrix<f64>, values: Vector<f64>) throws (InterpError) -> LinearND {
+        let v = list(values).clone();
+        try same(points.shape()[0], v.len(), "points", "values");
+        try finite(v, "values");
+        let tri = try Delaunay::new(points);
+        let tree = try KdTree::new(points);
+        LinearND { tri, tree, v, fill: f64::NAN }
+    }
+
+    /// This interpolant giving `v` outside the convex hull.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::LinearND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// assert((try LinearND::new(p, [1, 2, 3])).fill(-1.0).at([5.0, 5.0]) == -1.0);
+    /// ```
+    pub fn fill(self, v: f64) -> LinearND { LinearND { tri: self.tri, tree: self.tree, v: self.v, fill: v } }
+
+    /// The triangulation underneath.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::LinearND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// assert((try LinearND::new(p, [1, 2, 3])).triangulation().len() == 1);
+    /// ```
+    pub fn triangulation(self) -> Delaunay { self.tri }
+
+    /// The value at (px, py). A short walk from `hint` (the last
+    /// answer) serves nearby queries; past a few steps the walk restarts
+    /// from the triangle of the nearest vertex.
+    fn value(self, px: f64, py: f64, ref hint: usize, ref h: Heap, st: Stack) -> f64 {
+        if !(px.is_finite() && py.is_finite()) { return f64::NAN; }
+        let r = self.tri.walk(px, py, hint, 6);
+        if r == -2 {
+            let start = self.start(px, py, ref h, st);
+            r = self.tri.walk(px, py, start, 4 * self.tri.len() + 16);
+            if r == -2 { r = (self.tri.locate(px, py, start) ?? return self.fill) as isize; }
+        }
+        if r < 0 { return self.fill; }
+        let t = r as usize;
+        hint = t;
+        let (a, b, c) = self.tri.weights(t, px, py);
+        let o = 3 * t;
+        a * self.v[self.tri.tri[o]] + b * self.v[self.tri.tri[o + 2]] + c * self.v[self.tri.tri[o + 1]]
+    }
+
+    fn start(self, px: f64, py: f64, ref h: Heap, st: Stack) -> usize {
+        h.clear();
+        self.tree.search([px, py], 0, ref h, st);
+        if h.len == 0 { return 0; }
+        self.tri.around(h.i[0]) ?? 0
+    }
+
+    /// The value at `p` (two coordinates).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::LinearND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// assert((try LinearND::new(p, [0, 1, 1])).at([0.5, 0.5]) == 1.0);
+    /// ```
+    pub fn at(self, p: Vector<f64>) -> f64 {
+        if p.len() != 2 { return f64::NAN; }
+        let h = Heap::new(1);
+        let st = Stack::new();
+        let t = self.start(p[0], p[1], ref h, st);
+        self.value(p[0], p[1], ref t, ref h, st)
+    }
+
+    /// The value at every row of `ps` (m x 2). Each walk starts from the
+    /// previous answer, so nearby rows in order cost O(1) each.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::LinearND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    /// let q: Matrix<f64> = [[0.1, 0.1], [0.2, 0.3]];
+    /// let v = try (try LinearND::new(p, [0, 1, 0])).eval(q);
+    /// assert((v[1] - 0.2).abs() < 1e-15);
+    /// ```
+    pub fn eval(self, ps: Matrix<f64>) throws (InterpError) -> Vector<f64> {
+        let s = ps.shape();
+        try arg(s[1] == 2, f"query points must be m x 2, got {s[0]} x {s[1]}");
+        let src = list(ps);
+        let out = List::filled(s[0], 0.0);
+        let h = Heap::new(1);
+        let st = Stack::new();
+        let t = if s[0] > 0 { self.start(src[0], src[1], ref h, st) } else { 0 };
+        for i in 0..s[0] { out[i] = self.value(src[2 * i], src[2 * i + 1], ref t, ref h, st); }
+        Array::from(out)
+    }
+}
+
+impl ops::Call<Vector<f64>> for LinearND {
+    type Output = f64;
+    fn call(self, p: Vector<f64>) -> f64 { self.at(p) }
+}
+
+/// Nearest-neighbor interpolation in any dimension: the value of the
+/// closest data point (the lowest row among equally close ones), found
+/// with a k-d tree.
+///
+/// ```nabi
+/// use interpolate::scatter::NearestND;
+/// use core::array::Matrix;
+///
+/// let p: Matrix<f64> = [[0, 0, 0], [1, 1, 1]];
+/// let f = try NearestND::new(p, [10, 20]);
+/// assert(f([0.9, 0.8, 0.7]) == 20.0);
+/// ```
+#[derive(Clone)]
+pub struct NearestND {
+    tree: KdTree;
+    v: List<f64>;
+}
+
+impl NearestND {
+    /// The interpolant of `values[i]` at row `i` of `points` (n x d,
+    /// n >= 1).
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::NearestND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0], [1]];
+    /// assert((try NearestND::new(p, [5, 6])).at([0.4]) == 5.0);
+    /// ```
+    pub fn new(points: Matrix<f64>, values: Vector<f64>) throws (InterpError) -> NearestND {
+        let v = list(values).clone();
+        try same(points.shape()[0], v.len(), "points", "values");
+        try arg(v.len() > 0, "NearestND needs at least one point");
+        let tree = try KdTree::new(points);
+        NearestND { tree, v }
+    }
+
+    /// The value at `p`; NaN when `p` has the wrong length or is not
+    /// finite.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::NearestND;
+    /// use core::array::Matrix;
+    ///
+    /// let p: Matrix<f64> = [[0, 0], [4, 0]];
+    /// assert((try NearestND::new(p, [1, 2])).at([3.0, 9.0]) == 2.0);
+    /// ```
+    pub fn at(self, p: Vector<f64>) -> f64 {
+        let (i, _) = try? self.tree.nearest(p) ?? return f64::NAN;
+        self.v[i]
+    }
+
+    /// The value at every row of `ps` (m x d), in parallel for large m.
+    ///
+    /// ```nabi
+    /// use interpolate::scatter::NearestND;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let p: Matrix<f64> = [[0], [1], [2]];
+    /// let q: Matrix<f64> = [[0.2], [1.9]];
+    /// assert(try (try NearestND::new(p, [7, 8, 9])).eval(q) == Vector::<f64>::from([7.0, 9.0]));
+    /// ```
+    pub fn eval(self, ps: Matrix<f64>) throws (InterpError) -> Vector<f64> {
+        let (idx, _) = try self.tree.query(ps, 1);
+        let m = ps.shape()[0];
+        let out = List::filled(m, 0.0);
+        for i in 0..m { out[i] = self.v[idx[i, 0]]; }
+        Array::from(out)
+    }
+}
+
+impl ops::Call<Vector<f64>> for NearestND {
+    type Output = f64;
+    fn call(self, p: Vector<f64>) -> f64 { self.at(p) }
+}
+
+/// How `griddata` interpolates.
+///
+/// ```nabi
+/// use interpolate::scatter::Method;
+///
+/// assert(Method::Linear != Method::Nearest);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Method {
+    /// `LinearND`: barycentric on the Delaunay triangles (2-d only).
+    Linear,
+    /// `NearestND`: the closest data point (any d).
+    Nearest,
+}
+
+/// The data `values` at `points` (n x d) interpolated at the rows of
+/// `xi` (m x d), in one call: `LinearND` (NaN outside the hull) or
+/// `NearestND`.
+///
+/// ```nabi
+/// use interpolate::scatter::{Method, griddata};
+/// use core::array::Matrix;
+///
+/// let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [1, 1]];
+/// let q: Matrix<f64> = [[0.5, 0.5]];
+/// let v = try griddata(p, [0, 1, 1, 2], q, Method::Linear);
+/// assert((v[0] - 1.0).abs() < 1e-15);
+/// ```
+pub fn griddata(points: Matrix<f64>, values: Vector<f64>, xi: Matrix<f64>, method: Method = Method::Linear) throws (InterpError) -> Vector<f64> {
+    match method {
+        Method::Linear => try (try LinearND::new(points, values)).eval(xi),
+        Method::Nearest => try (try NearestND::new(points, values)).eval(xi),
+    }
+}

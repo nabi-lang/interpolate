@@ -1,0 +1,391 @@
+use pkg::scatter::{Delaunay, Kernel, KdTree, LinearND, Method, NearestND, Rbf, griddata, incircle, orient2d};
+use pkg::tests::suite::{close, expect, throws_kind};
+use core::array::{Array, Matrix, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn cloud(n: usize, d: usize, seed: u64) -> Matrix<f64> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(n * d);
+    for _ in 0..n * d { xs.push(g.uniform(-1.0, 1.0)); }
+    Array::from_list(xs, [n, d])
+}
+
+fn grid(k: usize) -> Matrix<f64> {
+    let xs: List<f64> = [];
+    for i in 0..k {
+        for j in 0..k {
+            xs.push(i as f64);
+            xs.push(j as f64);
+        }
+    }
+    Array::from_list(xs, [k * k, 2])
+}
+
+fn sgn(v: f64) -> i64 { if v > 0.0 { 1 } else if v < 0.0 { -1 } else { 0 } }
+
+#[test]
+fn orient_exact() {
+    expect(orient2d(0.0, 0.0, 1.0, 0.0, 0.0, 1.0) > 0.0, "ccw");
+    expect(orient2d(0.0, 0.0, 0.0, 1.0, 1.0, 0.0) < 0.0, "cw");
+    expect(orient2d(0.1, 0.1, 0.2, 0.2, 0.3, 0.3) == 0.0, "points on y = x");
+    expect(orient2d(0.5, 0.5, 12.0, 12.0, 24.0, 24.0) == 0.0, "Shewchuk's near-degenerate line");
+    // Near-collinear triples: every cyclic order must agree, and a swap
+    // must flip the sign; a plain float formula fails this often.
+    let g = Xoshiro256PlusPlus::seed(7);
+    let zeros = 0;
+    for _ in 0..2000 {
+        let (ax, ay) = (g.uniform(-1.0, 1.0), g.uniform(-1.0, 1.0));
+        let (bx, by) = (g.uniform(-1.0, 1.0), g.uniform(-1.0, 1.0));
+        let t = g.uniform(-2.0, 2.0);
+        let (cx, cy) = (ax + t * (bx - ax), ay + t * (by - ay));
+        let s = sgn(orient2d(ax, ay, bx, by, cx, cy));
+        expect(sgn(orient2d(bx, by, cx, cy, ax, ay)) == s && sgn(orient2d(cx, cy, ax, ay, bx, by)) == s, "cyclic orders agree");
+        expect(sgn(orient2d(bx, by, ax, ay, cx, cy)) == -s, "a swap flips the sign");
+        if s == 0 { zeros += 1; }
+    }
+    expect(zeros < 2000, "not everything collinear");
+}
+
+#[test]
+fn incircle_exact() {
+    expect(incircle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.2, 0.2) > 0.0, "inside");
+    expect(incircle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 2.0) < 0.0, "outside");
+    expect(incircle(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0) == 0.0, "square corner");
+    expect(incircle(0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.2, 0.2) < 0.0, "clockwise flips");
+    // Points on the unit circle, slightly off: permutations agree.
+    let g = Xoshiro256PlusPlus::seed(8);
+    for _ in 0..1000 {
+        let p: List<f64> = [];
+        for _ in 0..4 {
+            let a = g.uniform(0.0, 6.283185307179586);
+            p.push(a.cos());
+            p.push(a.sin());
+        }
+        let s = sgn(incircle(p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]));
+        expect(sgn(incircle(p[2], p[3], p[4], p[5], p[0], p[1], p[6], p[7])) == s, "cyclic");
+        expect(sgn(incircle(p[2], p[3], p[0], p[1], p[4], p[5], p[6], p[7])) == -s, "swap");
+    }
+}
+
+/// Every Delaunay property the tests rely on, checked exactly.
+fn check_delaunay(d: Delaunay, p: Matrix<f64>, distinct: usize, what: str) {
+    let t = d.simplices();
+    let m = d.len();
+    let n = p.shape()[0];
+    let used = List::filled(n, false);
+    for i in 0..m {
+        let (a, b, c) = (t[i, 0], t[i, 1], t[i, 2]);
+        used[a] = true;
+        used[b] = true;
+        used[c] = true;
+        expect(orient2d(p[a, 0], p[a, 1], p[b, 0], p[b, 1], p[c, 0], p[c, 1]) > 0.0, f"{what}: triangle {i} counterclockwise");
+        for q in 0..n {
+            if q == a || q == b || q == c { continue; }
+            expect(incircle(p[a, 0], p[a, 1], p[b, 0], p[b, 1], p[c, 0], p[c, 1], p[q, 0], p[q, 1]) <= 0.0, f"{what}: point {q} inside the circle of triangle {i}");
+        }
+    }
+    let v = 0;
+    for u in used { if u { v += 1; } }
+    expect(v == distinct, f"{what}: {v} vertices used, {distinct} distinct points");
+    let hl = d.hull();
+    let h = hl.len();
+    for k in 0..h {
+        let (a, b, c) = (hl[k], hl[(k + 1) % h], hl[(k + 2) % h]);
+        expect(orient2d(p[a, 0], p[a, 1], p[b, 0], p[b, 1], p[c, 0], p[c, 1]) >= 0.0, f"{what}: hull counterclockwise and convex");
+    }
+    expect(m == 2 * v - h - 2, f"{what}: {m} triangles, 2 v - h - 2 = {2 * v - h - 2}");
+    let nb = d.neighbors();
+    for i in 0..m {
+        for j in 0..3 {
+            let u = nb[i, j];
+            if u < 0 { continue; }
+            let back = nb[u, 0] == i as i64 || nb[u, 1] == i as i64 || nb[u, 2] == i as i64;
+            expect(back, f"{what}: neighbors symmetric");
+        }
+    }
+}
+
+#[test]
+fn delaunay_random() {
+    for seed in 1..4 {
+        let p = cloud(300, 2, seed);
+        let d = try! Delaunay::new(p);
+        check_delaunay(d, p, 300, f"random seed {seed}");
+    }
+}
+
+#[test]
+fn delaunay_grid() {
+    // Every unit square is cocircular: exact predicates keep it sane.
+    let p = grid(12);
+    let d = try! Delaunay::new(p);
+    check_delaunay(d, p, 144, "grid");
+    expect(d.len() == 2 * 11 * 11, f"{d.len()} triangles on a 12 x 12 grid");
+    expect(d.hull().len() == 44, f"hull of the grid {d.hull().len()}");
+}
+
+#[test]
+fn delaunay_duplicates() {
+    let base = cloud(80, 2, 4);
+    let xs = base.to_list();
+    for i in 0..30 {
+        xs.push(base[i, 0]);
+        xs.push(base[i, 1]);
+    }
+    let p: Matrix<f64> = Array::from_list(xs, [110, 2]);
+    let d = try! Delaunay::new(p);
+    check_delaunay(d, p, 80, "duplicates");
+}
+
+#[test]
+fn delaunay_near_collinear() {
+    // Points on a line, nudged by an ulp or so, and one well off it.
+    let xs: List<f64> = [];
+    for i in 0..40 {
+        let t = (i as f64) / 39.0;
+        xs.push(t);
+        // One ulp off the line for every third point.
+        xs.push(t * 0.3 * (if i % 3 == 0 { 1.0 + 2.220446049250313e-16 } else { 1.0 }));
+    }
+    xs.push(0.5);
+    xs.push(0.9);
+    let p: Matrix<f64> = Array::from_list(xs, [41, 2]);
+    let d = try! Delaunay::new(p);
+    check_delaunay(d, p, 41, "near collinear");
+}
+
+#[test]
+fn delaunay_small_and_errors() {
+    let tri: Matrix<f64> = [[0, 0], [1, 0], [0, 1]];
+    let d = try! Delaunay::new(tri);
+    expect(d.len() == 1 && d.hull().len() == 3, "one triangle");
+    expect(d.find_simplex([0.2, 0.2]) == 0, "inside");
+    expect(d.find_simplex([0.6, 0.6]) == none, "outside");
+    expect(d.find_simplex([0.5, 0.5]) == 0, "on the hull edge counts as inside");
+    let w = d.barycentric(0, [0.2, 0.3]);
+    close(w[0] + w[1] + w[2], 1.0, 1e-15, "weights sum to 1");
+    let line: Matrix<f64> = [[0, 0], [1, 1], [2, 2], [3, 3]];
+    expect(throws_kind(|| { _ = try Delaunay::new(line); }, "BadArgument"), "collinear");
+    let two: Matrix<f64> = [[0, 0], [1, 1]];
+    expect(throws_kind(|| { _ = try Delaunay::new(two); }, "BadArgument"), "two points");
+    let same: Matrix<f64> = [[1, 1], [1, 1], [1, 1], [1, 1]];
+    expect(throws_kind(|| { _ = try Delaunay::new(same); }, "BadArgument"), "one distinct point");
+    let wide: Matrix<f64> = [[0, 0, 0], [1, 0, 0], [0, 1, 0]];
+    expect(throws_kind(|| { _ = try Delaunay::new(wide); }, "BadArgument"), "3 columns");
+    let bad: Matrix<f64> = [[0, 0], [1, 0], [0, f64::NAN]];
+    expect(throws_kind(|| { _ = try Delaunay::new(bad); }, "NotFinite"), "NaN");
+}
+
+#[test]
+fn delaunay_locate() {
+    let p = cloud(500, 2, 11);
+    let d = try! Delaunay::new(p);
+    let t = d.simplices();
+    let g = Xoshiro256PlusPlus::seed(12);
+    for _ in 0..500 {
+        let (qx, qy) = (g.uniform(-1.2, 1.2), g.uniform(-1.2, 1.2));
+        match d.find_simplex(Array::from([qx, qy])) {
+            none => {
+                // Outside: some hull edge has it strictly to the right.
+                let h = d.hull();
+                let outside = false;
+                for k in 0..h.len() {
+                    let (a, b) = (h[k], h[(k + 1) % h.len()]);
+                    if orient2d(p[a, 0], p[a, 1], p[b, 0], p[b, 1], qx, qy) < 0.0 { outside = true; }
+                }
+                expect(outside, "none only outside the hull");
+            },
+            s: usize => {
+                for j in 0..3 {
+                    let (a, b) = (t[s, j], t[s, (j + 1) % 3]);
+                    expect(orient2d(p[a, 0], p[a, 1], p[b, 0], p[b, 1], qx, qy) >= 0.0, "found triangle holds the point");
+                }
+            },
+        }
+    }
+}
+
+fn brute(p: Matrix<f64>, q: List<f64>) -> List<(f64, usize)> {
+    let s = p.shape();
+    let out: List<(f64, usize)> = [];
+    for i in 0..s[0] {
+        let r2 = 0.0;
+        for k in 0..s[1] { r2 += (p[i, k] - q[k]) * (p[i, k] - q[k]); }
+        out.push((r2, i));
+    }
+    out.sort_by(|a: (f64, usize), b: (f64, usize)| if a.0 == b.0 { a.1.cmp(b.1) } else { a.0.total_cmp(b.0) });
+    out
+}
+
+#[test]
+fn kdtree_vs_brute() {
+    for d in [1usize, 2, 3, 5] {
+        let p = cloud(600, d, 20 + d as u64);
+        let t = try! KdTree::new(p);
+        expect(t.len() == 600 && t.dim() == d, "size");
+        let qs = cloud(40, d, 40 + d as u64);
+        for r in 0..40 {
+            let q = qs[r].to_list();
+            let want = brute(p, q);
+            let nb = try! t.knn(Array::from(q), 7);
+            expect(nb.indices.len() == 7, "k results");
+            for j in 0..7 {
+                expect(nb.indices[j] == want[j].1, f"d {d}: neighbor {j}");
+                close(nb.distances[j], want[j].0.sqrt(), 1e-15, "distance");
+            }
+            let rad = 0.4;
+            let inside: List<usize> = [];
+            for w in want { if w.0 <= rad * rad { inside.push(w.1); } }
+            inside.sort();
+            expect(try! t.radius(Array::from(q), rad) == Array::from(inside), f"d {d}: radius");
+        }
+    }
+}
+
+#[test]
+fn kdtree_batch() {
+    // Past the parallel threshold.
+    let p = cloud(3000, 3, 5);
+    let t = try! KdTree::new(p);
+    let qs = cloud(4000, 3, 6);
+    let (idx, dist) = try! t.query(qs, 3);
+    expect(idx.shape() == [4000, 3] && dist.shape() == [4000, 3], "shapes");
+    for r in [0usize, 1, 1999, 2048, 3999] {
+        let nb = try! t.knn(qs[r], 3);
+        for j in 0..3 {
+            expect(idx[r, j] == nb.indices[j] && dist[r, j] == nb.distances[j], f"row {r}");
+        }
+    }
+    // k past n: every point.
+    let small: Matrix<f64> = [[0, 0], [1, 1]];
+    let nb = try! (try! KdTree::new(small)).knn([0.0, 0.1], 10);
+    expect(nb.indices == Vector::<usize>::from([0, 1]), "k > n");
+}
+
+#[test]
+fn kdtree_edge_cases() {
+    let same: Matrix<f64> = Array::full([100, 2], 0.5);
+    let t = try! KdTree::new(same);
+    let nb = try! t.knn([0.5, 0.5], 4);
+    expect(nb.indices == Vector::<usize>::from([0, 1, 2, 3]), "ties keep low rows first");
+    expect(nb.distances[3] == 0.0, "zero distance");
+    let empty: Matrix<f64> = Matrix::zeros([0, 3]);
+    let e = try! KdTree::new(empty);
+    expect((try! e.knn([0.0, 0.0, 0.0], 3)).indices.len() == 0, "empty tree");
+    expect(throws_kind(|| { _ = try e.nearest([0.0, 0.0, 0.0]); }, "BadArgument"), "nearest of nothing");
+    expect(throws_kind(|| { _ = try t.knn([0.5], 1); }, "BadArgument"), "wrong dimension");
+    expect(throws_kind(|| { _ = try t.radius([0.5, 0.5], -1.0); }, "BadArgument"), "negative radius");
+    expect(throws_kind(|| { _ = try t.knn([f64::NAN, 0.0], 1); }, "NotFinite"), "NaN query");
+    let one: Matrix<f64> = [[2, 3]];
+    let (i, dd) = try! (try! KdTree::new(one)).nearest([5.0, 7.0]);
+    expect(i == 0 && dd == 5.0, "one point");
+}
+
+#[test]
+fn linear_nd_exact_on_planes() {
+    let p = cloud(400, 2, 31);
+    let vals = List::filled(400, 0.0);
+    for i in 0..400 { vals[i] = 3.0 - 2.0 * p[i, 0] + 0.5 * p[i, 1]; }
+    let f = try! LinearND::new(p, Array::from(vals));
+    let qs = cloud(300, 2, 32) .* 0.6;
+    let v = try! f.eval(qs);
+    for r in 0..300 {
+        let want = 3.0 - 2.0 * qs[r, 0] + 0.5 * qs[r, 1];
+        close(v[r], want, 1e-13, "plane reproduced");
+        close(f.at(qs[r]), v[r], 1e-15, "at = eval");
+    }
+    expect(f.at([5.0, 5.0]).is_nan(), "NaN outside");
+    expect(f.fill(0.25).at([5.0, 5.0]) == 0.25, "fill outside");
+    for i in 0..10 { close(f.at(p[i]), vals[i], 1e-13, "data points"); }
+    expect(throws_kind(|| { _ = try LinearND::new(p, [1, 2]); }, "LengthMismatch"), "lengths");
+}
+
+#[test]
+fn nearest_nd() {
+    let p = cloud(300, 4, 33);
+    let vals = List::filled(300, 0.0);
+    for i in 0..300 { vals[i] = i as f64; }
+    let f = try! NearestND::new(p, Array::from(vals));
+    let qs = cloud(50, 4, 34);
+    let v = try! f.eval(qs);
+    for r in 0..50 {
+        let want = brute(p, qs[r].to_list());
+        expect(v[r] == want[0].1 as f64, "nearest value");
+        expect(f.at(qs[r]) == v[r], "at = eval");
+    }
+    let q2: Matrix<f64> = [[0.0, 0.0, 0.0, 0.0]];
+    expect((try! griddata(p, Array::from(vals), q2, Method::Nearest))[0] == f.at([0.0, 0.0, 0.0, 0.0]), "griddata nearest");
+    let empty: Matrix<f64> = Matrix::zeros([0, 2]);
+    expect(throws_kind(|| { _ = try NearestND::new(empty, Vector::<f64>::from(List::<f64>::new())); }, "BadArgument"), "no points");
+}
+
+#[test]
+fn rbf_interpolates() {
+    let p = cloud(40, 2, 41);
+    let vals = List::filled(40, 0.0);
+    for i in 0..40 { vals[i] = (3.0 * p[i, 0]).sin() * p[i, 1] + p[i, 0] * p[i, 0]; }
+    let y: Vector<f64> = Array::from(vals);
+    let kernels = [Kernel::Linear, Kernel::ThinPlate, Kernel::Cubic, Kernel::Quintic, Kernel::Multiquadric, Kernel::InverseMultiquadric, Kernel::InverseQuadratic, Kernel::Gaussian];
+    for k in kernels {
+        let f = try! Rbf::new(p, y, kernel: k, epsilon: 2.0);
+        let v = try! f.eval(p);
+        for i in 0..40 { close(v[i], vals[i], 1e-8, f"{k:?} at node {i}"); }
+    }
+}
+
+#[test]
+fn rbf_reproduces_linear() {
+    let p = cloud(50, 3, 42);
+    let vals = List::filled(50, 0.0);
+    for i in 0..50 { vals[i] = 1.0 + 2.0 * p[i, 0] - p[i, 1] + 0.5 * p[i, 2]; }
+    let qs = cloud(400, 3, 43);
+    for k in [Kernel::ThinPlate, Kernel::Cubic, Kernel::Multiquadric, Kernel::Gaussian] {
+        let f = try! Rbf::new(p, Array::from(vals), kernel: k, epsilon: 1.5, degree: 1);
+        let v = try! f.eval(qs);
+        for r in 0..400 {
+            close(v[r], 1.0 + 2.0 * qs[r, 0] - qs[r, 1] + 0.5 * qs[r, 2], 1e-9, f"{k:?} linear");
+        }
+        close(f.at(qs[7]), v[7], 1e-12, "at = eval");
+    }
+}
+
+#[test]
+fn rbf_smoothing_and_errors() {
+    let p = cloud(60, 1, 44);
+    let vals = List::filled(60, 0.0);
+    let g = Xoshiro256PlusPlus::seed(45);
+    for i in 0..60 { vals[i] = p[i, 0] * p[i, 0] + 0.05 * g.normal(); }
+    let exact = try! Rbf::new(p, Array::from(vals));
+    let smooth = try! Rbf::new(p, Array::from(vals), smoothing: 1.0);
+    let (r0, r1) = (0.0, 0.0);
+    for i in 0..60 {
+        r0 += (exact.at(p[i]) - vals[i]).abs();
+        r1 += (smooth.at(p[i]) - vals[i]).abs();
+    }
+    expect(r0 < 1e-8 && r1 > 1e-3, f"smoothing leaves residuals: {r0} {r1}");
+    let tiny: Matrix<f64> = [[0, 0], [1, 0]];
+    expect(throws_kind(|| { _ = try Rbf::new(tiny, [1, 2]); }, "TooFewPoints"), "3 monomials, 2 points");
+    expect(throws_kind(|| { _ = try Rbf::new(tiny, [1, 2], kernel: Kernel::Quintic, degree: 1); }, "BadArgument"), "degree below the kernel's");
+    let dup: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [0, 1]];
+    expect(throws_kind(|| { _ = try Rbf::new(dup, [1, 2, 3, 4]); }, "Singular"), "repeated point");
+    expect(throws_kind(|| { _ = try Rbf::new(tiny, [1, 2], kernel: Kernel::Gaussian, epsilon: 0.0); }, "BadArgument"), "epsilon 0");
+    let gauss = try! Rbf::new(tiny, [1, 2], kernel: Kernel::Gaussian, degree: -1);
+    close(gauss.at([1.0, 0.0]), 2.0, 1e-12, "no polynomial");
+    expect(gauss.at([1.0]).is_nan(), "wrong length");
+}
+
+#[test]
+fn scattered_calls_and_clones() {
+    let p: Matrix<f64> = [[0, 0], [1, 0], [0, 1], [1, 1]];
+    let v: Vector<f64> = [0, 1, 2, 3];
+    let l = try! LinearND::new(p, v);
+    let n = try! NearestND::new(p, v);
+    let r = try! Rbf::new(p, v);
+    let t = try! KdTree::new(p);
+    let q: Vector<f64> = [0.5, 0.25];
+    expect(l(q) == l.at(q) && n(q) == n.at(q) && r(q) == r.at(q), "f(p) is f.at(p)");
+    close(l([0.5, 0.25]), 1.0, 1e-15, "a literal point");
+    let (lc, nc, rc, tc) = (l.clone(), n.clone(), r.clone(), t.clone());
+    expect(lc(q) == l(q) && nc(q) == n(q) && rc(q) == r(q), "clones evaluate alike");
+    expect((try! tc.nearest(q)).0 == (try! t.nearest(q)).0, "a cloned tree");
+}

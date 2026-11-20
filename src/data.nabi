@@ -1,0 +1,77 @@
+// Input checks shared by every interpolant, and the interval search.
+
+use pkg::InterpError;
+use core::array::{Array, Vector};
+
+/// The elements of `a` as a list, shared when `a` is contiguous.
+pub(pkg) fn list<const N: usize>(a: Array<f64, N>) -> List<f64> { a.as_list() ?? a.to_list() }
+
+/// A new rank-1 array over `xs` (no copy).
+pub(pkg) fn vector(xs: List<f64>) -> Vector<f64> { Array::view_list(xs, [xs.len()]) }
+
+/// `NotFinite` unless every element of `xs` is finite.
+pub(pkg) fn finite(xs: List<f64>, what: str) throws (InterpError) {
+    for i in 0..xs.len() {
+        if !xs[i].is_finite() { throw InterpError::NotFinite { what: f"{what} (at {i})" }; }
+    }
+}
+
+/// `NotSorted` unless `xs` rises strictly.
+pub(pkg) fn rising(xs: List<f64>) throws (InterpError) {
+    for i in 1..xs.len() {
+        if !(xs[i] > xs[i - 1]) { throw InterpError::NotSorted { at: i }; }
+    }
+}
+
+/// `TooFewPoints` unless `n >= need`.
+pub(pkg) fn enough(n: usize, need: usize) throws (InterpError) {
+    if n < need { throw InterpError::TooFewPoints { need, got: n }; }
+}
+
+/// `LengthMismatch` unless `a == b`.
+pub(pkg) fn same(a: usize, b: usize, an: str, bn: str) throws (InterpError) {
+    if a != b { throw InterpError::LengthMismatch { what: f"{an} has {a} values, {bn} has {b}; pass one {bn} per {an}" }; }
+}
+
+/// `BadArgument` with `what` unless `ok`.
+pub(pkg) fn arg(ok: bool, what: str) throws (InterpError) {
+    if !ok { throw InterpError::BadArgument { what }; }
+}
+
+/// Checked sample pairs: finite, the same length, at least `need`, `x`
+/// rising strictly.
+pub(pkg) fn pairs(x: Vector<f64>, y: Vector<f64>, need: usize) throws (InterpError) -> (List<f64>, List<f64>) {
+    let xs = list(x);
+    let ys = list(y);
+    try same(xs.len(), ys.len(), "x", "y");
+    try enough(xs.len(), need);
+    try finite(xs, "x");
+    try finite(ys, "y");
+    try rising(xs);
+    (xs, ys)
+}
+
+/// The interval `i` of the rising breakpoints `b` with `b[i] <= x <
+/// b[i + 1]`, clamped to `0..b.len() - 1` (`b.len() >= 2`); NaN gives 0.
+/// Binary search, O(log n).
+pub(pkg) fn interval(b: List<f64>, x: f64) -> usize {
+    let n = b.len();
+    if !(x >= b[1]) { return 0; }
+    if x >= b[n - 2] { return n - 2; }
+    let (lo, hi) = (1usize, n - 2);
+    // b[lo] <= x < b[hi]
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if x >= b[mid] { lo = mid; } else { hi = mid; }
+    }
+    lo
+}
+
+/// `interval` starting from a guess `i` (the last answer): O(1) for
+/// sorted or nearby queries, O(log n) otherwise.
+pub(pkg) fn interval_from(b: List<f64>, x: f64, i: usize) -> usize {
+    let n = b.len();
+    if i + 2 < n && x >= b[i] && x < b[i + 1] { return i; }
+    if i + 3 < n && x >= b[i + 1] && x < b[i + 2] { return i + 1; }
+    interval(b, x)
+}

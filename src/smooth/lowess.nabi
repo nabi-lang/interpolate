@@ -1,0 +1,142 @@
+//! LOWESS, locally weighted scatterplot smoothing (Cleveland 1979):
+//! at each x, the weighted least-squares line through the nearest
+//! frac * n points with tricube weights; then `iters` robustness passes
+//! that reweight by the bisquare of the residuals over six median
+//! absolute residuals. O(iters n k) for k = frac n neighbours, less with
+//! `delta`.
+
+use pkg::InterpError;
+use pkg::data::{arg, finite, list, same, vector};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// The LOWESS fit of `y` on `x` at every `x`, in input order (`x` need
+/// not be sorted). `frac` is the share of points in each local fit (at
+/// least 2 points), `iters` the robustness passes (0 for the plain
+/// local fit), and `delta` skips the fit at points within `delta` of the
+/// last one fitted, interpolating linearly there instead (0 fits every
+/// point; about 1% of the x range is a good speed-up for large n).
+///
+/// ```nabi
+/// let y = try interpolate::lowess([0, 1, 2, 3, 4, 5], [1, 3, 5, 7, 9, 11]);
+/// assert((y[2] - 5.0).abs() < 1e-12);
+/// ```
+pub fn lowess<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, frac: f64 = 0.6666666666666666, iters: usize = 3, delta: f64 = 0.0) throws (InterpError) -> Vector<f64> {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let (x0, y0) = (list(x), list(y));
+    try same(x0.len(), y0.len(), "x", "y");
+    try finite(x0, "x");
+    try finite(y0, "y");
+    try arg(frac > 0.0 && frac <= 1.0, f"frac = {frac} must be in (0, 1]");
+    try arg(delta >= 0.0 && delta.is_finite(), f"delta = {delta} must be finite and >= 0");
+    let n = x0.len();
+    if n == 0 { return vector([]); }
+    let order: List<usize> = List::with_capacity(n);
+    for i in 0..n { order.push(i); }
+    order.sort_by(|a: usize, b: usize| x0[a].total_cmp(x0[b]));
+    let xs = List::filled(n, 0.0);
+    let ys = List::filled(n, 0.0);
+    for i in 0..n {
+        xs[i] = x0[order[i]];
+        ys[i] = y0[order[i]];
+    }
+    let k = ((frac * (n as f64) + 1e-9).floor() as usize).max(2).min(n);
+    let fit = List::filled(n, 0.0);
+    let rw = List::filled(n, 1.0);
+    let res = List::filled(n, 0.0);
+    for it in 0..=iters {
+        pass(xs, ys, rw, k, delta, fit);
+        if it == iters { break; }
+        for i in 0..n { res[i] = (ys[i] - fit[i]).abs(); }
+        let sorted = res.clone();
+        sorted.sort_by(|a: f64, b: f64| a.total_cmp(b));
+        let med = if n % 2 == 1 { sorted[n / 2] } else { 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]) };
+        // Every residual zero: the fit is exact.
+        if med == 0.0 { break; }
+        let c = 6.0 * med;
+        for i in 0..n {
+            let u = res[i] / c;
+            rw[i] = if u < 1.0 { (1.0 - u * u) * (1.0 - u * u) } else { 0.0 };
+        }
+    }
+    let out = List::filled(n, 0.0);
+    for i in 0..n { out[order[i]] = fit[i]; }
+    vector(out)
+}
+
+/// One pass over sorted `xs` with robustness weights `rw`, into `fit`.
+fn pass(xs: List<f64>, ys: List<f64>, rw: List<f64>, k: usize, delta: f64, fit: List<f64>) {
+    let n = xs.len();
+    let ws = List::filled(k, 0.0);
+    let lo = 0usize;
+    let last: isize = -1;
+    let i = 0usize;
+    while i < n {
+        // Slide [lo, lo + k) to the k nearest points of xs[i].
+        while lo + k < n && xs[i] - xs[lo] > xs[lo + k] - xs[i] { lo += 1; }
+        fit[i] = local(xs, ys, rw, lo, lo + k, xs[i], ws);
+        // Fill the skipped points linearly.
+        if last >= 0 && (last as usize) + 1 < i {
+            let a = last as usize;
+            let span = xs[i] - xs[a];
+            for j in (a + 1)..i {
+                let t = if span > 0.0 { (xs[j] - xs[a]) / span } else { 0.0 };
+                fit[j] = fit[a] + t * (fit[i] - fit[a]);
+            }
+        }
+        last = i as isize;
+        // Ties share the fit; then skip to the last point within delta.
+        let j = i + 1;
+        while j < n && xs[j] == xs[i] {
+            fit[j] = fit[i];
+            last = j as isize;
+            j += 1;
+        }
+        let next = j;
+        if delta > 0.0 {
+            while next < n && xs[next] <= xs[i] + delta { next += 1; }
+            // Fit the last point within delta, at least one step on.
+            next = if next > j { next - 1 } else { j };
+        }
+        i = next;
+    }
+}
+
+/// The weighted line through points `a..b` at `x`.
+/// `ws` is scratch of at least `b - a`.
+fn local(xs: List<f64>, ys: List<f64>, rw: List<f64>, a: usize, b: usize, x: f64, ws: List<f64>) -> f64 {
+    let h = (x - xs[a]).max(xs[b - 1] - x);
+    let (h1, h9) = (0.001 * h, 0.999 * h);
+    let (sw, sx, sy) = (0.0, 0.0, 0.0);
+    for j in a..b {
+        let d = (xs[j] - x).abs();
+        let w = if d <= h1 { 1.0 } else if d > h9 { 0.0 } else {
+            let u = d / h;
+            let t = 1.0 - u * u * u;
+            t * t * t
+        };
+        let w = w * rw[j];
+        ws[j - a] = w;
+        sw += w;
+        sx += w * xs[j];
+        sy += w * ys[j];
+    }
+    if sw <= 0.0 {
+        // Every neighbour weighted out: the plain mean of the window.
+        let s = 0.0;
+        for j in a..b { s += ys[j]; }
+        return s / ((b - a) as f64);
+    }
+    let (mx, my) = (sx / sw, sy / sw);
+    let (sxx, sxy) = (0.0, 0.0);
+    for j in a..b {
+        let dx = xs[j] - mx;
+        sxx += ws[j - a] * dx * dx;
+        sxy += ws[j - a] * dx * (ys[j] - my);
+    }
+    let range = xs[b - 1] - xs[a];
+    // A flat window (or one point weighted in): the weighted mean.
+    if sxx <= 1e-14 * range * range * sw { return my; }
+    my + sxy / sxx * (x - mx)
+}

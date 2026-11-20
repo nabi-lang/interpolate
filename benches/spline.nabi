@@ -1,0 +1,122 @@
+// 1-d interpolants and gridded splines. Items are samples fitted or
+// points evaluated, so items/s reads as points/s.
+
+use pkg::{Curve, GridMethod};
+use core::array::{Array, Matrix, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+const M: usize = 1000000;
+
+fn xs(n: usize) -> Vector<f64> {
+    let v: List<f64> = List::with_capacity(n);
+    for i in 0..n { v.push((i as f64) * 1e-3 + 1e-4 * ((i * 7919 % 13) as f64) / 13.0); }
+    Array::from_list(v, [n])
+}
+
+fn ys(x: Vector<f64>) -> Vector<f64> { f64::sin.(x) }
+
+fn random(n: usize, lo: f64, hi: f64, seed: u64) -> Vector<f64> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let v: List<f64> = List::with_capacity(n);
+    for _ in 0..n { v.push(g.uniform(lo, hi)); }
+    Array::from_list(v, [n])
+}
+
+#[bench]
+fn cubic_spline_fit_1m(b: Bench) {
+    let x = xs(M);
+    let y = ys(x);
+    b.set_items(M as i64);
+    b.iter(|| try! pkg::cubic_spline(black_box(x), black_box(y)));
+}
+
+#[bench]
+fn cubic_spline_eval_sorted_1m(b: Bench) {
+    let x = xs(M);
+    let s = try! pkg::cubic_spline(x, ys(x));
+    let q = Array::from(num::linspace(0.0, 1000.0, M));
+    b.set_items(M as i64);
+    b.iter(|| s.eval(black_box(q)));
+}
+
+#[bench]
+fn cubic_spline_eval_random_1m(b: Bench) {
+    let x = xs(M);
+    let s = try! pkg::cubic_spline(x, ys(x));
+    let q = random(M, 0.0, 1000.0, 1);
+    b.set_items(M as i64);
+    b.iter(|| s.eval(black_box(q)));
+}
+
+#[bench]
+fn pchip_fit_1m(b: Bench) {
+    let x = xs(M);
+    let y = ys(x);
+    b.set_items(M as i64);
+    b.iter(|| try! pkg::pchip(black_box(x), black_box(y)));
+}
+
+#[bench]
+fn linear_eval_random_1m(b: Bench) {
+    let x = xs(M);
+    let f = try! pkg::linear(x, ys(x));
+    let q = random(M, 0.0, 1000.0, 2);
+    b.set_items(M as i64);
+    b.iter(|| f.eval(black_box(q)));
+}
+
+#[bench]
+fn bspline_fit_1m(b: Bench) {
+    let x = xs(M);
+    let y = ys(x);
+    b.set_items(M as i64);
+    b.iter(|| try! pkg::make_interp_spline(black_box(x), black_box(y)));
+}
+
+#[bench]
+fn bspline_eval_sorted_1m(b: Bench) {
+    let x = xs(M);
+    let s = try! pkg::make_interp_spline(x, ys(x));
+    let q = Array::from(num::linspace(0.0, 1000.0, M));
+    b.set_items(M as i64);
+    b.iter(|| s.eval(black_box(q)));
+}
+
+#[bench]
+fn splrep_smooth_1e4(b: Bench) {
+    let x = xs(10000);
+    let y = ys(x) .+ random(10000, -0.1, 0.1, 3);
+    b.set_items(10000);
+    b.iter(|| try! pkg::splrep(black_box(x), black_box(y), s: 10000.0 * 0.01 / 3.0));
+}
+
+#[bench]
+fn bilinear_eval_1m(b: Bench) {
+    let a = Array::from(num::linspace(0.0, 1.0, 1000));
+    let z = Matrix::<f64>::from_fn([1000, 1000], |i: [usize; 2]| -> f64 { ((i[0] * i[1]) % 17) as f64 });
+    let g = try! pkg::grid([a, a], z, GridMethod::Linear);
+    let p = Array::from_list(random(2 * M, 0.0, 1.0, 4).to_list(), [M, 2]);
+    b.set_items(M as i64);
+    b.iter(|| try! g.eval(black_box(p)));
+}
+
+#[bench]
+fn bicubic_fit_1000x1000(b: Bench) {
+    let a = Array::from(num::linspace(0.0, 1.0, 1000));
+    let z = Matrix::<f64>::from_fn([1000, 1000], |i: [usize; 2]| -> f64 { ((i[0] * i[1]) % 17) as f64 });
+    b.set_items(M as i64);
+    b.iter(|| try! pkg::bicubic(black_box(a), black_box(a), black_box(z)));
+}
+
+#[bench]
+fn bicubic_eval_1e5(b: Bench) {
+    let a = Array::from(num::linspace(0.0, 1.0, 1000));
+    let z = Matrix::<f64>::from_fn([1000, 1000], |i: [usize; 2]| -> f64 { ((i[0] * i[1]) % 17) as f64 });
+    let s = try! pkg::bicubic(a, a, z);
+    let n = 100000usize;
+    let p = Array::from_list(random(2 * n, 0.0, 1.0, 5).to_list(), [n, 2]);
+    b.set_items(n as i64);
+    b.iter(|| try! s.eval(black_box(p)));
+}

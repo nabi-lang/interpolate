@@ -1,0 +1,244 @@
+//! The cubic smoothing spline: the g minimizing
+//! sum w_i (y_i - g(x_i))^2 + lam * integral g''^2, by Reinsch's algorithm
+//! (1967): with Q the second-difference and R the tridiagonal Gram
+//! matrices of the natural cubic spline, the second derivatives solve
+//! the pentadiagonal SPD system (R + lam Q^T W^-1 Q) gamma = Q^T y, and
+//! g = y - lam W^-1 Q gamma. Banded Cholesky, O(n). Without `lam`,
+//! generalized cross-validation (Craven and Wahba 1979) picks it; the
+//! trace of the hat matrix comes from the band of the inverse
+//! (Hutchinson and de Hoog 1985), O(n) per trial.
+
+use pkg::banded::SymBand;
+use pkg::data::{arg, list, pairs, same};
+use pkg::{InterpError, PPoly};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// The cubic smoothing spline of `(x, y)` with weights `w` (default all
+/// 1) and penalty `lam` on `integral g''^2`, a natural cubic `PPoly`
+/// with breakpoints at `x`. `lam` near 0 interpolates; a huge `lam`
+/// gives the weighted least-squares line. When `lam` is `none`, the
+/// value minimizing the GCV score `n RSS / tr(I - A)^2` is found by a
+/// log-spaced scan and golden-section refinement (about 60 O(n)
+/// solves). `x` must rise strictly; at least 3 points.
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0, 1, 2, 3, 4];
+/// let y: Vector<f64> = [0, 1, 2, 3, 4];                 // a line is not smoothed
+/// let s = try interpolate::make_smoothing_spline(x, y, 10.0);
+/// assert((s.at(2.5) - 2.5).abs() < 1e-12);
+/// let g = try interpolate::make_smoothing_spline(x, [0.1, 0.9, 2.2, 2.8, 4.1]);
+/// assert((g.at(2.0) - 2.0).abs() < 0.2);
+/// ```
+pub fn make_smoothing_spline<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, lam: f64? = none, w: Vector<f64>? = none) throws (InterpError) -> PPoly {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let (xs, ys) = try pairs(x, y, 3);
+    let n = xs.len();
+    let ws = match w {
+        none => List::filled(n, 1.0),
+        v: Vector<f64> => list(v),
+    };
+    try same(ws.len(), n, "w", "x");
+    for i in 0..n { try arg(ws[i] > 0.0 && ws[i].is_finite(), f"weight w[{i}] = {ws[i]} must be positive and finite"); }
+    let sys = Reinsch::new(xs, ys, ws);
+    let l = match lam {
+        v: f64 => {
+            try arg(v >= 0.0 && v.is_finite(), f"lam = {v} must be finite and >= 0");
+            v
+        },
+        none => try sys.gcv(),
+    };
+    let (g, gam) = try sys.fit(l);
+    natural(xs, g, gam)
+}
+
+/// The natural cubic with values `g` and interior second derivatives
+/// `gam` (zero at both ends).
+fn natural(x: List<f64>, g: List<f64>, gam: List<f64>) -> PPoly {
+    let n = x.len();
+    let c = List::filled((n - 1) * 4, 0.0);
+    let m = |i: usize| -> f64 { if i == 0 || i == n - 1 { 0.0 } else { gam[i - 1] } };
+    for i in 0..n - 1 {
+        let h = x[i + 1] - x[i];
+        let (a, b) = (m(i), m(i + 1));
+        c[4 * i] = g[i];
+        c[4 * i + 1] = (g[i + 1] - g[i]) / h - h * (2.0 * a + b) / 6.0;
+        c[4 * i + 2] = 0.5 * a;
+        c[4 * i + 3] = (b - a) / (6.0 * h);
+    }
+    PPoly::raw(x.clone(), 3, c)
+}
+
+/// The fixed parts of the system: R, P = Q^T W^-1 Q (both lower bands of
+/// half width 2) and Q^T y.
+struct Reinsch {
+    x: List<f64>;
+    y: List<f64>;
+    w: List<f64>;
+    r: SymBand;
+    p: SymBand;
+    qty: List<f64>;
+}
+
+impl Reinsch {
+    fn new(x: List<f64>, y: List<f64>, w: List<f64>) -> Reinsch {
+        let n = x.len();
+        let m = n - 2;
+        let h = List::filled(n - 1, 0.0);
+        for i in 0..n - 1 { h[i] = x[i + 1] - x[i]; }
+        let r = SymBand::new(m, 2);
+        let p = SymBand::new(m, 2);
+        let qty = List::filled(m, 0.0);
+        for j in 0..m {
+            r.add(j, j, (h[j] + h[j + 1]) / 3.0);
+            if j > 0 { r.add(j, j - 1, h[j] / 3.0); }
+            qty[j] = y[j] / h[j] - y[j + 1] * (1.0 / h[j] + 1.0 / h[j + 1]) + y[j + 2] / h[j + 1];
+        }
+        // Column j of Q: rows j, j + 1, j + 2.
+        let q = |i: usize, j: usize| -> f64 {
+            if i == j { 1.0 / h[j] } else if i == j + 1 { -1.0 / h[j] - 1.0 / h[j + 1] } else if i == j + 2 { 1.0 / h[j + 1] } else { 0.0 }
+        };
+        for j in 0..m {
+            let k0 = if j >= 2 { j - 2 } else { 0 };
+            for k in k0..=j {
+                let s = 0.0;
+                for i in j..=(k + 2) { s += q(i, j) * q(i, k) / w[i]; }
+                p.add(j, k, s);
+            }
+        }
+        Reinsch { x, y, w, r, p, qty }
+    }
+
+    /// The factored `R + lam P`.
+    fn system(self, lam: f64) throws (InterpError) -> SymBand {
+        let m = self.r.n;
+        let a = SymBand::new(m, 2);
+        for i in 0..a.a.len() { a.a[i] = self.r.a[i] + lam * self.p.a[i]; }
+        try a.factor("smoothing spline system (repeated or badly scaled x?)");
+        a
+    }
+
+    /// Fitted values and interior second derivatives at `lam`.
+    fn fit(self, lam: f64) throws (InterpError) -> (List<f64>, List<f64>) {
+        let a = try self.system(lam);
+        let gam = self.qty.clone();
+        a.solve(gam);
+        (self.values(lam, gam), gam)
+    }
+
+    fn values(self, lam: f64, gam: List<f64>) -> List<f64> {
+        let n = self.x.len();
+        let m = n - 2;
+        let g = self.y.clone();
+        for j in 0..m {
+            let (h0, h1) = (self.x[j + 1] - self.x[j], self.x[j + 2] - self.x[j + 1]);
+            let v = lam * gam[j];
+            g[j] -= v / h0 / self.w[j];
+            g[j + 1] -= v * (-1.0 / h0 - 1.0 / h1) / self.w[j + 1];
+            g[j + 2] -= v / h1 / self.w[j + 2];
+        }
+        g
+    }
+
+    /// The GCV score at `lam`.
+    fn score(self, lam: f64) throws (InterpError) -> f64 {
+        let a = try self.system(lam);
+        let gam = self.qty.clone();
+        a.solve(gam);
+        let g = self.values(lam, gam);
+        let n = self.x.len();
+        let rss = 0.0;
+        for i in 0..n { rss += self.w[i] * (self.y[i] - g[i]) * (self.y[i] - g[i]); }
+        let s = band_inverse(a);
+        // tr(I - A) = lam tr(M^-1 P), over the band only.
+        let t = 0.0;
+        let m = a.n;
+        for j in 0..m {
+            t += s[3 * j] * self.p.get(j, j);
+            if j + 1 < m { t += 2.0 * s[3 * j + 1] * self.p.get(j + 1, j); }
+            if j + 2 < m { t += 2.0 * s[3 * j + 2] * self.p.get(j + 2, j); }
+        }
+        let tr = lam * t;
+        let nf = n as f64;
+        nf * rss / (tr * tr)
+    }
+
+    /// The `lam` minimizing GCV over `[r 1e-8, r 1e8]`, `r = tr R / tr P`
+    /// the scale where both terms weigh alike.
+    fn gcv(self) throws (InterpError) -> f64 {
+        let (tr, tp) = (0.0, 0.0);
+        for j in 0..self.r.n {
+            tr += self.r.get(j, j);
+            tp += self.p.get(j, j);
+        }
+        let mid = (tr / tp).log10();
+        let (lo, hi, steps) = (mid - 8.0, mid + 8.0, 32usize);
+        let best = 0usize;
+        let bv = f64::INFINITY;
+        for k in 0..=steps {
+            let t = lo + (hi - lo) * (k as f64) / (steps as f64);
+            let v = try self.score(10f64.pow(t));
+            if v < bv {
+                bv = v;
+                best = k;
+            }
+        }
+        let step = (hi - lo) / (steps as f64);
+        let (a, b) = (lo + step * ((best as f64) - 1.0), lo + step * ((best as f64) + 1.0));
+        // Golden section on log10 lam.
+        let gr = 0.6180339887498949;
+        let (c, d) = (b - gr * (b - a), a + gr * (b - a));
+        let fc = try self.score(10f64.pow(c));
+        let fd = try self.score(10f64.pow(d));
+        for _ in 0..40 {
+            if fc < fd {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - gr * (b - a);
+                fc = try self.score(10f64.pow(c));
+            } else {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + gr * (b - a);
+                fd = try self.score(10f64.pow(d));
+            }
+            if b - a < 1e-6 { break; }
+        }
+        let t = 0.5 * (a + b);
+        let v = try self.score(10f64.pow(t));
+        if v <= bv { 10f64.pow(t) } else { 10f64.pow(lo + step * (best as f64)) }
+    }
+}
+
+/// The band (half width 2) of the inverse of a Cholesky-factored
+/// `SymBand`: `s[3 i + d]` is `(M^-1)[i, i + d]`. From `M = L D L^T`
+/// (unit L), `L^T S = D^-1 L^-1` read in its upper triangle gives each
+/// entry from the ones below and right of it (Hutchinson and de Hoog).
+pub(pkg) fn band_inverse(a: SymBand) -> List<f64> {
+    let (n, p) = (a.n, a.p);
+    let s = List::filled(n * (p + 1), 0.0);
+    let sig = |i: usize, j: usize| -> f64 {
+        let (r, c) = if i <= j { (i, j) } else { (j, i) };
+        s[r * (p + 1) + (c - r)]
+    };
+    let i = n;
+    while i > 0 {
+        i -= 1;
+        let lii = a.a[a.pos(i, i)];
+        let top = (i + p).min(n - 1);
+        let j = top + 1;
+        while j > i {
+            j -= 1;
+            let v = if j == i { 1.0 / (lii * lii) } else { 0.0 };
+            for k in (i + 1)..=top { v -= a.a[a.pos(k, i)] / lii * sig(k, j); }
+            s[i * (p + 1) + (j - i)] = v;
+        }
+    }
+    s
+}

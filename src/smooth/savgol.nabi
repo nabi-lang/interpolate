@@ -1,0 +1,165 @@
+//! Savitzky-Golay filters (1964): each output is the value (or a
+//! derivative) at the window's centre of the least-squares polynomial
+//! through the window, which is a fixed correlation with weights from
+//! the pseudo-inverse of the window's Vandermonde matrix.
+
+use pkg::InterpError;
+use pkg::data::{arg, finite, list, vector};
+use core::array::{Array, Matrix, Vector};
+use linalg::AsVector;
+
+/// How `savgol_filter` treats the first and last `window / 2` samples.
+///
+/// ```nabi
+/// use interpolate::Edge;
+///
+/// let y = try interpolate::savgol_filter([1, 2, 4, 7, 11, 16, 22], 5, 2, mode: Edge::Interp);
+/// assert((y[0] - 1.0).abs() < 1e-12);       // the edge fit is the quadratic itself
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Edge {
+    /// Fit the polynomial to the first (last) whole window and evaluate
+    /// it there (the default).
+    Interp,
+    /// Reflect about the end sample, without repeating it: `y[2] y[1] |
+    /// y[0] y[1] ...`.
+    Mirror,
+    /// Repeat the end sample.
+    Nearest,
+    /// Pad with this value.
+    Constant(f64),
+    /// Wrap around: the signal is periodic.
+    Wrap,
+}
+
+/// The pseudo-inverse rows of the window's Vandermonde matrix on `u =
+/// z / m`, z in -m..=m: row i gives the coefficient of `u^i`.
+fn pinv(window: usize, order: usize) throws (InterpError) -> Matrix<f64> {
+    let m = (window / 2) as f64;
+    let a: Matrix<f64> = Array::zeros([window, order + 1]);
+    for r in 0..window {
+        let u = ((r as f64) - m) / m.max(1.0);
+        let p = 1.0;
+        for i in 0..order + 1 {
+            a[r, i] = p;
+            p *= u;
+        }
+    }
+    let x = try linalg::pinv(a) catch e: linalg::LinalgError {
+        throw InterpError::Singular { what: f"Savitzky-Golay window of {window}: {e}" };
+    };
+    x
+}
+
+/// Weights giving the `deriv`-th derivative at offset `z` (in samples
+/// from the window centre) of the window's fit.
+fn weights(pi: Matrix<f64>, window: usize, order: usize, deriv: usize, delta: f64, z: f64) -> List<f64> {
+    let m = ((window / 2) as f64).max(1.0);
+    let u = z / m;
+    let out = List::filled(window, 0.0);
+    for i in deriv..order + 1 {
+        // d^deriv/du^deriv u^i at u, then du/dx = 1 / (m delta).
+        let f = 1.0;
+        for t in 0..deriv { f *= (i - t) as f64; }
+        let c = f * u.powi((i - deriv) as i32) / (m * delta).powi(deriv as i32);
+        for r in 0..window { out[r] += c * pi[i, r]; }
+    }
+    out
+}
+
+fn check(window: usize, order: usize, deriv: usize, delta: f64) throws (InterpError) {
+    try arg(window % 2 == 1, f"window = {window} must be odd (the fit is centred); use {window + 1}");
+    try arg(order < window, f"polyorder = {order} must be below window = {window}");
+    try arg(delta > 0.0 && delta.is_finite(), f"delta = {delta} must be positive (the sample spacing)");
+    _ = deriv;
+}
+
+/// The correlation weights of a Savitzky-Golay filter: output `i` is
+/// `sum_j c[j] y[i + j - window / 2]`, the `deriv`-th derivative of the
+/// degree-`polyorder` least-squares fit over the window, for samples
+/// `delta` apart. `window` must be odd and above `polyorder`; a `deriv`
+/// above `polyorder` gives zeros.
+///
+/// ```nabi
+/// let c = try interpolate::savgol_coeffs(5, 2);
+/// assert((c[0] * 35.0 + 3.0).abs() < 1e-12 && (c[2] * 35.0 - 17.0).abs() < 1e-12);
+/// ```
+pub fn savgol_coeffs(window: usize, polyorder: usize, deriv: usize = 0, delta: f64 = 1.0) throws (InterpError) -> Vector<f64> {
+    try check(window, polyorder, deriv, delta);
+    let pi = try pinv(window, polyorder);
+    vector(weights(pi, window, polyorder, deriv, delta, 0.0))
+}
+
+/// `y` filtered by a Savitzky-Golay filter (see `savgol_coeffs`), the
+/// ends handled by `mode`. A polynomial of degree up to `polyorder`
+/// passes unchanged (its derivative, with `deriv`). O(n window). `Interp`
+/// needs `window <= y.len()`, the others more than `window / 2` samples.
+///
+/// ```nabi
+/// use interpolate::Edge;
+///
+/// let y = try interpolate::savgol_filter([0, 1, 4, 9, 16, 25], 3, 2);
+/// assert((y[3] - 9.0).abs() < 1e-12);
+/// let d = try interpolate::savgol_filter([0, 1, 4, 9, 16, 25], 5, 2, deriv: 1, mode: Edge::Nearest);
+/// assert((d[2] - 4.0).abs() < 1e-12);
+/// ```
+pub fn savgol_filter<Y: AsVector<f64>>(y: Y, window: usize, polyorder: usize, deriv: usize = 0, delta: f64 = 1.0, mode: Edge = Edge::Interp) throws (InterpError) -> Vector<f64> {
+    let y: Vector<f64> = y.as_vector();
+    try check(window, polyorder, deriv, delta);
+    let ys = list(y);
+    try finite(ys, "y");
+    let n = ys.len();
+    let m = window / 2;
+    match mode {
+        Edge::Interp => try arg(window <= n, f"mode Interp needs window = {window} <= y.len() = {n}; use a smaller window or another Edge"),
+        _ => try arg(n > m, f"y has {n} samples, fewer than window / 2 + 1 = {m + 1}"),
+    }
+    let pi = try pinv(window, polyorder);
+    let c = weights(pi, window, polyorder, deriv, delta, 0.0);
+    let out = List::filled(n, 0.0);
+    if n >= window {
+        for i in m..n - m {
+            let s = 0.0;
+            let o = i - m;
+            for j in 0..window { s += c[j] * ys[o + j]; }
+            out[i] = s;
+        }
+    }
+    let at = |k: isize| -> f64 {
+        let nn = n as isize;
+        if k >= 0 && k < nn { return ys[k as usize]; }
+        match mode {
+            Edge::Mirror => {
+                let r = if k < 0 { -k } else { 2 * (nn - 1) - k };
+                ys[r.max(0).min(nn - 1) as usize]
+            },
+            Edge::Nearest => if k < 0 { ys[0] } else { ys[n - 1] },
+            Edge::Constant(v) => v,
+            Edge::Wrap => ys[(((k % nn) + nn) % nn) as usize],
+            Edge::Interp => 0.0,
+        }
+    };
+    let edges: List<usize> = [];
+    for i in 0..m.min(n) { edges.push(i); }
+    for i in (n - m.min(n))..n {
+        if i >= m { edges.push(i); }
+    }
+    for i in edges {
+        match mode {
+            Edge::Interp => {
+                // The fit over the first or last window, evaluated at i.
+                let (o, z) = if i < m { (0usize, (i as f64) - (m as f64)) } else { (n - window, (i as f64) - ((n - window + m) as f64)) };
+                let wz = weights(pi, window, polyorder, deriv, delta, z);
+                let s = 0.0;
+                for j in 0..window { s += wz[j] * ys[o + j]; }
+                out[i] = s;
+            },
+            _ => {
+                let s = 0.0;
+                for j in 0..window { s += c[j] * at((i as isize) + (j as isize) - (m as isize)); }
+                out[i] = s;
+            },
+        }
+    }
+    vector(out)
+}

@@ -1,0 +1,170 @@
+use pkg::tests::suite::{close, expect, linspace, rel, sorted, throws_kind};
+use core::array::{Array, Vector};
+use core::range::Range;
+
+/// `quad` meets `exact` within its own error, and the error within the
+/// tolerance asked for.
+fn within(f: fn(f64) -> f64, r: Range<f64>, exact: f64, what: str) {
+    let q = try! pkg::quad(f, r);
+    let tol = 1.49e-8f64.max(1.49e-8 * exact.abs());
+    expect((q.value - exact).abs() <= q.error, f"{what}: |{q.value} - {exact}| > error {q.error}");
+    expect(q.error <= tol, f"{what}: error {q.error} above tolerance {tol}");
+}
+
+#[test]
+fn trapezoid_lines_exact() {
+    let x = sorted(50, -3.0, 4.0, 1);
+    let y = x .* 3.0 .+ 1.0;
+    let (a, b) = (x[0], x[49]);
+    close(try! pkg::trapezoid(y, x), 1.5 * (b * b - a * a) + (b - a), 1e-12, "line, uneven x");
+    let u = linspace(0.0, 2.0, 11);
+    close(try! pkg::trapezoid(u .* u, 0.2), 2.68, 1e-14, "x^2 trapezoid h=0.2");
+    // Falling x gives the negative.
+    let back: Vector<f64> = [2, 1, 0];
+    close(try! pkg::trapezoid(Vector::<f64>::from([1.0, 1.0, 1.0]), back), -2.0, 0.0, "falling x");
+    expect(try! pkg::trapezoid(Vector::<f64>::from([5.0])) == 0.0, "one sample");
+    expect(throws_kind(|| { _ = try pkg::trapezoid(y, u); }, "LengthMismatch"), "length mismatch");
+}
+
+#[test]
+fn cumulative() {
+    let x = linspace(0.0, 1.0, 101);
+    let c = try! pkg::cumulative_trapezoid(x .* 2.0, x);
+    expect(c.len() == 100, "n - 1 values");
+    for i in 0..100 { close(c[i], x[i + 1] * x[i + 1], 1e-4, "integral of 2x"); }
+    let d = try! pkg::cumulative_trapezoid(x, 0.01, initial: 0.0);
+    expect(d.len() == 101 && d[0] == 0.0, "with initial");
+    close(d[100], 0.5, 1e-14, "integral of x (exact for lines)");
+    expect((try! pkg::cumulative_trapezoid(Vector::<f64>::from([]))).len() == 0, "empty");
+}
+
+#[test]
+fn simpson_exact() {
+    // Odd count, uniform: exact for cubics.
+    let x = linspace(-1.0, 2.0, 31);
+    let y = x .* x .* x .- x .* 2.0 .+ 1.0;
+    close(try! pkg::simpson(y, x), 3.75 - 3.0 + 3.0, 1e-13, "cubic, x");
+    close(try! pkg::simpson(y, 0.1), 3.75, 1e-13, "cubic, dx");
+    // Uneven grid: exact for quadratics, odd and even counts.
+    for n in [9usize, 10usize, 4usize] {
+        let s = sorted(n, 0.0, 1.0, n as u64);
+        s[0] = 0.0;
+        s[n - 1] = 1.0;
+        let q = s .* s .* 3.0 .+ 1.0;
+        close(try! pkg::simpson(q, s), 2.0, 1e-13, f"quadratic, uneven, n = {n}");
+    }
+    // Even count, uniform: the end correction keeps quadratics exact.
+    let e = linspace(0.0, 1.0, 10);
+    close(try! pkg::simpson(e .* e, e), 1.0 / 3.0, 1e-15, "x^2, even n");
+    close(try! pkg::simpson(Vector::<f64>::from([1.0, 3.0]), 2.0), 4.0, 0.0, "two samples");
+}
+
+#[test]
+fn romb_tables() {
+    // 2^2 + 1 samples: exact to degree 5.
+    let x = linspace(0.0, 4.0, 5);
+    close(try! pkg::romb(x .** 5.0), 4.0 ** 6 / 6.0, 1e-10, "x^5");
+    let fine = linspace(0.0, f64::PI, 65);
+    close(try! pkg::romb(f64::sin.(fine), f64::PI / 64.0), 2.0, 1e-13, "sin");
+    expect(throws_kind(|| { _ = try pkg::romb(linspace(0.0, 1.0, 6)); }, "BadArgument"), "6 samples");
+    expect(try! pkg::romb(Vector::<f64>::from([3.0])) == 0.0, "one sample");
+}
+
+#[test]
+fn quad_known_integrals() {
+    within(|x: f64| -> f64 { x * x }, 0.0..3.0, 9.0, "x^2");
+    within(f64::sin, 0.0..f64::PI, 2.0, "sin");
+    within(|x: f64| -> f64 { 1.0 / x.sqrt() }, 0.0..1.0, 2.0, "x^-1/2");
+    within(f64::ln, 0.0..1.0, -1.0, "ln x");
+    within(|x: f64| -> f64 { 1.0 / (1.0 - x * x).sqrt() }, -1.0..1.0, f64::PI, "1/sqrt(1 - x^2)");
+    within(|x: f64| -> f64 { x.ln() / x.sqrt() }, 0.0..1.0, -4.0, "ln x / sqrt x");
+    within(|x: f64| -> f64 { (50.0 * x).sin() }, 0.0..1.0, (1.0 - 50.0f64.cos()) / 50.0, "sin 50x");
+    within(|x: f64| -> f64 { (-x * x).exp() }, f64::NEG_INFINITY..f64::INFINITY, f64::PI.sqrt(), "exp(-x^2) on R");
+    within(|x: f64| -> f64 { (-x * x).exp() }, 0.0..f64::INFINITY, 0.5 * f64::PI.sqrt(), "exp(-x^2) on R+");
+    within(|x: f64| -> f64 { 1.0 / (1.0 + x * x) }, 0.0..f64::INFINITY, 0.5 * f64::PI, "1/(1+x^2) on R+");
+    within(|x: f64| -> f64 { 1.0 / (1.0 + x * x) }, f64::NEG_INFINITY..1.0, 0.75 * f64::PI, "1/(1+x^2) to 1");
+    within(|x: f64| -> f64 { (-x).exp() * x.sqrt() }, 0.0..f64::INFINITY, 0.5 * f64::PI.sqrt(), "Gamma(3/2)");
+    // A tight tolerance on a smooth integrand.
+    let q = try! pkg::quad(f64::exp, 0.0..1.0, epsabs: 0.0, epsrel: 1e-13);
+    close(q.value, f64::E - 1.0, 4e-16, "exp tight");
+    expect(q.error <= 1e-13 * q.value, "tight error");
+    // Reversed and empty ranges.
+    close((try! pkg::quad(f64::sin, f64::PI..0.0)).value, -2.0, 1e-14, "reversed");
+    expect((try! pkg::quad(f64::sin, 1.0..1.0)).value == 0.0, "empty");
+}
+
+#[test]
+fn quad_failures() {
+    // Divergent: NoConvergence with an estimate.
+    let ok = try { _ = try pkg::quad(|x: f64| -> f64 { 1.0 / x }, 0.0..1.0); false } catch e: pkg::InterpError {
+        match e {
+            pkg::InterpError::NoConvergence { iterations, .. } => iterations >= 1,
+            _ => false,
+        }
+    };
+    expect(ok, "1/x diverges");
+    expect(throws_kind(|| { _ = try pkg::quad(|x: f64| -> f64 { (300.0 * x).sin() }, 0.0..10.0, limit: 3); }, "NoConvergence"), "limit 3");
+    expect(throws_kind(|| { _ = try pkg::quad(|x: f64| -> f64 { f64::NAN }, 0.0..1.0); }, "NotFinite"), "NaN integrand");
+    expect(throws_kind(|| { _ = try pkg::quad(f64::sin, 0.0..f64::NAN); }, "NotFinite"), "NaN end");
+    expect(throws_kind(|| { _ = try pkg::quad(f64::sin, 0.0..1.0, epsabs: 0.0, epsrel: 0.0); }, "BadArgument"), "zero tolerance");
+    expect(throws_kind(|| { _ = try pkg::quad(f64::sin, 0.0..1.0, limit: 0); }, "BadArgument"), "limit 0");
+}
+
+#[test]
+fn romberg_smooth() {
+    let q = try! pkg::romberg(f64::exp, 0.0..1.0);
+    close(q.value, f64::E - 1.0, 1e-12, "exp");
+    expect(q.error <= 1.48e-8, "error");
+    close((try! pkg::romberg(|x: f64| -> f64 { x ** 3 }, 0.0..2.0)).value, 4.0, 1e-14, "cubic");
+    expect(throws_kind(|| { _ = try pkg::romberg(f64::exp, 0.0..f64::INFINITY); }, "BadArgument"), "infinite");
+    expect(throws_kind(|| { _ = try pkg::romberg(|x: f64| -> f64 { 1.0 / x.sqrt() }, 0.0..1.0, divmax: 4); }, "NotFinite"), "singular end");
+    expect(throws_kind(|| { _ = try pkg::romberg(|x: f64| -> f64 { (40.0 * x).sin() }, 0.0..3.0, divmax: 3); }, "NoConvergence"), "divmax 3");
+}
+
+#[test]
+fn gauss_legendre_exact() {
+    let (x3, w3) = try! pkg::gauss_legendre(3);
+    close(x3[2], 0.6f64.sqrt(), 1e-15, "node");
+    close(x3[1], 0.0, 0.0, "middle node");
+    close(w3[0], 5.0 / 9.0, 1e-15, "weight");
+    close(w3[1], 8.0 / 9.0, 1e-15, "middle weight");
+    for n in 1..=40usize {
+        let (x, w) = try! pkg::gauss_legendre(n);
+        close(w.sum(), 2.0, 1e-13, f"weights n = {n}");
+        for i in 1..n { expect(x[i] > x[i - 1], "rising"); }
+        // Degree 2n - 2 even: 2 / (2n - 1); degree 2n - 1 odd: 0.
+        let e = (2 * n - 2) as f64;
+        let s = 0.0;
+        let t = 0.0;
+        for i in 0..n {
+            s += w[i] * x[i].pow(e);
+            t += w[i] * x[i].pow(e + 1.0);
+        }
+        close(s, 2.0 / (e + 1.0), 1e-13, f"x^{e}, n = {n}");
+        close(t, 0.0, 1e-13, f"odd, n = {n}");
+    }
+    close(try! pkg::fixed_quad(|x: f64| -> f64 { x ** 9 - x ** 4 }, 0.0..1.0), 0.1 - 0.2, 1e-15, "degree 9 with 5 nodes");
+    expect(throws_kind(|| { _ = try pkg::gauss_legendre(0); }, "BadArgument"), "n = 0");
+}
+
+#[test]
+fn double_triple() {
+    let q = try! pkg::dblquad(|x: f64, y: f64| -> f64 { x * y * y }, 0.0..2.0, 0.0..1.0);
+    close(q.value, 2.0 / 3.0, 1e-13, "x y^2");
+    let s = try! pkg::dblquad(|x: f64, y: f64| -> f64 { (x + y).sin() }, 0.0..1.0, 0.0..1.0);
+    rel(s.value, 2.0 * 1.0f64.sin() - 2.0f64.sin(), 1e-12, "sin(x + y)");
+    expect((s.value - (2.0 * 1.0f64.sin() - 2.0f64.sin())).abs() <= s.error, "within error");
+    let g = try! pkg::dblquad(|x: f64, y: f64| -> f64 { (-(x * x + y * y)).exp() }, 0.0..f64::INFINITY, 0.0..f64::INFINITY);
+    rel(g.value, 0.25 * f64::PI, 1e-10, "gaussian quadrant");
+    let disc = try! pkg::dblquad_over(|x: f64, y: f64| -> f64 { 1.0 }, -1.0..1.0, |x: f64| -> Range<f64> { -(1.0 - x * x).sqrt()..(1.0 - x * x).sqrt() });
+    rel(disc.value, f64::PI, 1e-9, "unit disc");
+    let c = try! pkg::tplquad(|x: f64, y: f64, z: f64| -> f64 { x * y * z }, 0.0..1.0, 0.0..1.0, 0.0..1.0);
+    close(c.value, 0.125, 1e-14, "x y z");
+    let e = try! pkg::tplquad(|x: f64, y: f64, z: f64| -> f64 { (x + y + z).exp() }, 0.0..1.0, 0.0..1.0, 0.0..1.0);
+    rel(e.value, (f64::E - 1.0) ** 3, 1e-12, "exp(x + y + z)");
+    let ball = try! pkg::tplquad_over(|x: f64, y: f64, z: f64| -> f64 { 1.0 }, -1.0..1.0,
+        |x: f64| -> Range<f64> { -(1.0 - x * x).sqrt()..(1.0 - x * x).sqrt() },
+        |x: f64, y: f64| -> Range<f64> { -(1.0 - x * x - y * y).max(0.0).sqrt()..(1.0 - x * x - y * y).max(0.0).sqrt() });
+    rel(ball.value, 4.0 / 3.0 * f64::PI, 1e-7, "unit ball");
+    expect(throws_kind(|| { _ = try pkg::dblquad(|x: f64, y: f64| -> f64 { 1.0 / y }, 0.0..1.0, 0.0..1.0); }, "NoConvergence"), "inner diverges");
+}

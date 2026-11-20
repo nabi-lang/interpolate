@@ -1,0 +1,310 @@
+//! B-splines: a spline of degree k as coefficients on a knot vector,
+//! evaluated by de Boor's algorithm, with derivatives, antiderivatives,
+//! integrals and roots; built by interpolation (`make_interp_spline`),
+//! least squares (`make_lsq_spline`) or smoothing (`splrep`).
+
+pub(pkg) mod basis;
+pub(pkg) mod fit;
+pub(pkg) mod smooth;
+
+use pkg::bspline::basis::span;
+use pkg::curve::{fill, wrap};
+use pkg::data::{arg, enough, finite, list, same, vector};
+use pkg::{Curve, Extrapolate, InterpError, PPoly};
+use core::array::{Array, Vector};
+use core::range::Range;
+
+/// A spline of degree `k`, `s(x) = sum_i c[i] B[i, k](x)`, on the knots
+/// `t` (n + k + 1 of them, non-decreasing) with `n` coefficients. Its
+/// base interval is `[t[k], t[n]]`; outside it the end pieces continue
+/// (`Extrapolate::Extend`). Evaluation is de Boor's algorithm,
+/// O(log n + k^2), stable for any degree.
+///
+/// ```nabi
+/// use interpolate::{BSpline, Curve};
+///
+/// // Bernstein form on clamped knots: x^2 on [0, 1].
+/// let b = try BSpline::new([0, 0, 0, 1, 1, 1], [0, 0, 1], 2);
+/// assert(b.at(0.5) == 0.25 && b.at(1.0) == 1.0);
+/// ```
+#[derive(Clone)]
+pub struct BSpline {
+    pub(pkg) t: List<f64>;
+    pub(pkg) c: List<f64>;
+    pub(pkg) k: usize;
+    pub(pkg) mode: Extrapolate;
+}
+
+impl BSpline {
+    /// The spline with knots `t`, coefficients `c` and degree `k`:
+    /// `t.len() == c.len() + k + 1`, `t` non-decreasing, with a nonempty
+    /// base interval.
+    ///
+    /// ```nabi
+    /// use interpolate::{BSpline, Curve};
+    ///
+    /// // Coefficients 0, 1, 2 on clamped linear knots: the line y = x.
+    /// let b = try BSpline::new([0, 0, 1, 2, 2], [0, 1, 2], 1);
+    /// assert(b.at(1.25) == 1.25);
+    /// ```
+    pub fn new(t: Vector<f64>, c: Vector<f64>, k: usize) throws (InterpError) -> BSpline {
+        let ts = list(t).clone();
+        let cs = list(c).clone();
+        try enough(cs.len(), k + 1);
+        try same(ts.len(), cs.len() + k + 1, "t", "c (plus k + 1)");
+        try finite(ts, "t");
+        try finite(cs, "c");
+        for i in 1..ts.len() {
+            if ts[i] < ts[i - 1] { throw InterpError::NotSorted { at: i }; }
+        }
+        try arg(ts[k] < ts[cs.len()], "the base interval t[k]..t[n] is empty; spread the knots");
+        BSpline { t: ts, c: cs, k, mode: Extrapolate::Extend }
+    }
+
+    pub(pkg) fn raw(t: List<f64>, c: List<f64>, k: usize) -> BSpline { BSpline { t, c, k, mode: Extrapolate::Extend } }
+
+    /// This spline with extrapolation `mode`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Curve, Extrapolate};
+    ///
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3], [0, 1, 4, 9]);
+    /// assert(b.extrapolate(Extrapolate::Clamp).at(5.0) == 9.0);
+    /// ```
+    pub fn extrapolate(self, mode: Extrapolate) -> BSpline { BSpline { t: self.t, c: self.c, k: self.k, mode } }
+
+    /// The knots.
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3], [0, 1, 4, 9]);
+    /// assert(b.knots().len() == b.coefficients().len() + 4);
+    /// ```
+    pub fn knots(self) -> Vector<f64> { vector(self.t.clone()) }
+
+    /// The coefficients.
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([0, 1], [3, 5], 1);
+    /// assert(b.coefficients()[1] == 5.0);
+    /// ```
+    pub fn coefficients(self) -> Vector<f64> { vector(self.c.clone()) }
+
+    /// The degree.
+    pub fn degree(self) -> usize { self.k }
+
+    /// The base interval `(t[k], t[n])`.
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([1, 2, 3, 4], [0, 1, 0, 1]);
+    /// assert(b.domain() == (1.0, 4.0));
+    /// ```
+    pub fn domain(self) -> (f64, f64) { (self.t[self.k], self.t[self.c.len()]) }
+
+    /// de Boor's algorithm in span `l`; `d` is scratch of k + 1.
+    pub(pkg) fn deboor(self, l: usize, x: f64, d: List<f64>) -> f64 {
+        let k = self.k;
+        for j in 0..=k { d[j] = self.c[j + l - k]; }
+        for r in 1..=k {
+            let j = k;
+            while j >= r {
+                let i = j + l - k;
+                let den = self.t[i + k + 1 - r] - self.t[i];
+                let a = if den > 0.0 { (x - self.t[i]) / den } else { 0.0 };
+                d[j] = (1.0 - a) * d[j - 1] + a * d[j];
+                j -= 1;
+            }
+        }
+        d[k]
+    }
+
+    /// The `nu`-th derivative, a spline of degree `k - nu` on the inner
+    /// knots (zero once `nu > k`).
+    ///
+    /// ```nabi
+    /// use interpolate::Curve;
+    ///
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3, 4], [0, 1, 8, 27, 64]);
+    /// assert((b.derivative(1).at(2.5) - 18.75).abs() < 1e-12);
+    /// ```
+    pub fn derivative(self, nu: usize = 1) -> BSpline {
+        let s = self;
+        for _ in 0..nu {
+            if s.k == 0 {
+                return BSpline { t: s.t, c: List::filled(s.c.len(), 0.0), k: 0, mode: s.mode };
+            }
+            let (n, k) = (s.c.len(), s.k);
+            let c = List::filled(n - 1, 0.0);
+            for i in 0..n - 1 {
+                let den = s.t[i + k + 1] - s.t[i + 1];
+                c[i] = if den > 0.0 { (k as f64) * (s.c[i + 1] - s.c[i]) / den } else { 0.0 };
+            }
+            s = BSpline { t: s.t[1:s.t.len() - 1].to_list(), c, k: k - 1, mode: s.mode };
+        }
+        s
+    }
+
+    /// The `nu`-th antiderivative, a spline of degree `k + nu`, zero at
+    /// the start of the base interval.
+    ///
+    /// ```nabi
+    /// use interpolate::Curve;
+    ///
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3], [1, 1, 1, 1]);
+    /// assert((b.antiderivative(1).at(3.0) - 3.0).abs() < 1e-14);
+    /// ```
+    pub fn antiderivative(self, nu: usize = 1) -> BSpline {
+        let s = self;
+        for _ in 0..nu {
+            let (n, k) = (s.c.len(), s.k);
+            let t: List<f64> = List::with_capacity(s.t.len() + 2);
+            t.push(s.t[0]);
+            for v in s.t { t.push(v); }
+            t.push(s.t[s.t.len() - 1]);
+            let c = List::filled(n + 1, 0.0);
+            let acc = 0.0;
+            for i in 0..n {
+                acc += s.c[i] * (s.t[i + k + 1] - s.t[i]) / ((k + 1) as f64);
+                c[i + 1] = acc;
+            }
+            let a = BSpline { t, c, k: k + 1, mode: s.mode };
+            // Zero at the start of the base interval.
+            let z = a.raw_at(s.t[k]);
+            for i in 0..n + 1 { a.c[i] -= z; }
+            s = a;
+        }
+        s
+    }
+
+    /// The value with no extrapolation rule (end pieces continue).
+    pub(pkg) fn raw_at(self, x: f64) -> f64 {
+        let d = List::filled(self.k + 1, 0.0);
+        self.deboor(span(self.t, self.k, self.c.len(), x), x, d)
+    }
+
+    /// The same function as a `PPoly` on the distinct knots of the base
+    /// interval: each piece's Taylor coefficients at its left end, from
+    /// the derivatives.
+    ///
+    /// ```nabi
+    /// use interpolate::Curve;
+    ///
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3, 4], [0, 1, 0, 1, 0]);
+    /// let p = b.to_ppoly();
+    /// assert((p.at(2.7) - b.at(2.7)).abs() < 1e-14);
+    /// ```
+    pub fn to_ppoly(self) -> PPoly {
+        let (n, k) = (self.c.len(), self.k);
+        let br: List<f64> = [];
+        let spans: List<usize> = [];
+        for l in k..n {
+            if self.t[l + 1] > self.t[l] {
+                br.push(self.t[l]);
+                spans.push(l);
+            }
+        }
+        br.push(self.t[n]);
+        let ds: List<BSpline> = [self];
+        for j in 1..=k { ds.push(ds[j - 1].derivative(1)); }
+        let c = List::filled(spans.len() * (k + 1), 0.0);
+        let d = List::filled(k + 1, 0.0);
+        for m in 0..spans.len() {
+            let l = spans[m];
+            let f = 1.0;
+            for j in 0..=k {
+                if j > 0 { f *= j as f64; }
+                // Derivative j lives on knots t[j..], the same span is l - j.
+                c[m * (k + 1) + j] = ds[j].deboor(l - j, br[m], d) / f;
+            }
+        }
+        PPoly::raw(br, k, c).extrapolate(self.mode)
+    }
+
+    /// The integral over `r`, following the extrapolation mode as
+    /// `PPoly::integrate` does.
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3], [0, 1, 4, 9]);
+    /// assert((b.integrate(0.0..3.0) - 9.0).abs() < 1e-13);
+    /// ```
+    pub fn integrate(self, r: Range<f64>) -> f64 {
+        if self.mode == Extrapolate::Extend {
+            let a = self.antiderivative(1);
+            return a.raw_at(r.end) - a.raw_at(r.start);
+        }
+        self.to_ppoly().integrate(r)
+    }
+
+    /// The real `x` in the base interval where the spline equals `y`,
+    /// rising (see `PPoly::solve`).
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([0, 1, 2, 3], [-1, 1, -1, 1]);
+    /// assert(b.solve(0.0).len() == 3);
+    /// ```
+    pub fn solve(self, y: f64 = 0.0) -> Vector<f64> { self.to_ppoly().solve(y) }
+
+    /// The real roots in the base interval, `solve(0.0)`.
+    ///
+    /// ```nabi
+    /// let b = try interpolate::make_interp_spline([0, 1, 2], [-1, 0, 1], 1);
+    /// assert(b.roots() == core::array::Vector::<f64>::from([1.0]));
+    /// ```
+    pub fn roots(self) -> Vector<f64> { self.to_ppoly().solve(0.0) }
+}
+
+impl Curve for BSpline {
+    fn at(self, x: f64) -> f64 {
+        let (lo, hi) = self.domain();
+        let u = wrap(self.mode, x, lo, hi) ?? return fill(self.mode);
+        self.raw_at(u)
+    }
+
+    fn eval<const N: usize>(self, xs: Array<f64, N>) -> Array<f64, N> {
+        let src = list(xs);
+        let out = List::filled(src.len(), 0.0);
+        let (lo, hi) = self.domain();
+        let (n, k) = (self.c.len(), self.k);
+        let d = List::filled(k + 1, 0.0);
+        let l = k;
+        for m in 0..src.len() {
+            let u = wrap(self.mode, src[m], lo, hi) ?? f64::NAN;
+            if u.is_nan() && !src[m].is_nan() {
+                out[m] = fill(self.mode);
+                continue;
+            }
+            // Sorted input stays in or next to the last span.
+            let fits = (l == k || u >= self.t[l]) && (l == n - 1 || u < self.t[l + 1]);
+            if !fits { l = span(self.t, k, n, u); }
+            out[m] = self.deboor(l, u, d);
+        }
+        Array::view_list(out, xs.shape())
+    }
+}
+
+/// `b` at every element of `x` (its `der`-th derivative when `der > 0`),
+/// FITPACK's `splev`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let b = try interpolate::splrep([0, 1, 2, 3], [0, 1, 4, 9]);
+/// let xs: Vector<f64> = [1.5];
+/// assert((interpolate::splev(xs, b, 1)[0] - 3.0).abs() < 1e-12);
+/// ```
+pub fn splev<const N: usize>(x: Array<f64, N>, b: BSpline, der: usize = 0) -> Array<f64, N> { b.derivative(der).eval(x) }
+
+/// The integral of `b` over `r`, FITPACK's `splint`.
+///
+/// ```nabi
+/// let b = try interpolate::splrep([0, 1, 2, 3], [2, 2, 2, 2]);
+/// assert((interpolate::splint(0.0..3.0, b) - 6.0).abs() < 1e-14);
+/// ```
+pub fn splint(r: Range<f64>, b: BSpline) -> f64 { b.integrate(r) }
+
+/// The roots of `b` in its base interval, FITPACK's `sproot`.
+///
+/// ```nabi
+/// let b = try interpolate::splrep([0, 1, 2, 3], [-1, 1, -1, 1]);
+/// assert(interpolate::sproot(b).len() == 3);
+/// ```
+pub fn sproot(b: BSpline) -> Vector<f64> { b.roots() }

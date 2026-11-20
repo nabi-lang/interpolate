@@ -1,0 +1,145 @@
+use pkg::tests::suite::{close, expect, linspace, rel, sorted, throws_kind, uniform};
+use pkg::{BSpline, Boundary, Curve, Extrapolate};
+use core::array::{Array, Vector};
+
+fn poly(x: f64, k: usize) -> f64 {
+    let s = 0.0;
+    for j in 0..=k { s += ((j % 3) as f64 - 0.7) * x ** (j as i32); }
+    s
+}
+
+#[test]
+fn interp_spline_reproduces_its_degree() {
+    for k in 1usize..=5 {
+        let x = sorted(20, -1.0, 2.0, 10 + k as u64);
+        let y = x.map(|t: f64| -> f64 { poly(t, k) });
+        let b = try! pkg::make_interp_spline(x, y, k);
+        expect(b.degree() == k, "degree");
+        for t in linspace(-1.0, 2.0, 61) {
+            if t < x[0] || t > x[19] { continue; }
+            rel(b.at(t), poly(t, k), 1e-9, f"degree {k}");
+        }
+        for i in 0..20 { rel(b.at(x[i]), y[i], 1e-12, "interpolates"); }
+    }
+    // k = 0: steps at the data.
+    let s = try! pkg::make_interp_spline([0, 1, 2], [5, 6, 7], 0);
+    expect(s.at(0.5) == 5.0 && s.at(1.5) == 6.0, "k = 0");
+}
+
+#[test]
+fn interp_spline_matches_cubic_spline() {
+    let x = sorted(40, 0.0, 10.0, 21);
+    let y = uniform(40, -2.0, 2.0, 22);
+    let b = try! pkg::make_interp_spline(x, y);
+    let c = try! pkg::cubic_spline(x, y);
+    for t in linspace(0.0, 10.0, 201) { close(b.at(t), c.at(t), 1e-10, "not-a-knot"); }
+    for bc in [Boundary::Natural, Boundary::Clamped, Boundary::Slopes(1.0, -2.0), Boundary::Curvatures(0.5, 3.0)] {
+        let b2 = try! pkg::make_interp_spline(x, y, 3, bc);
+        let c2 = try! pkg::cubic_spline_with(x, y, bc);
+        for t in linspace(0.0, 10.0, 101) { close(b2.at(t), c2.at(t), 1e-10, f"{bc:?}"); }
+    }
+    expect(throws_kind(|| { _ = try pkg::make_interp_spline([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5], 5, Boundary::Natural); }, "BadArgument"), "bc needs k = 3");
+}
+
+#[test]
+fn bspline_calculus() {
+    let x = sorted(25, 0.0, 4.0, 31);
+    let y = x.map(|t: f64| -> f64 { t.sin() * t });
+    let b = try! pkg::make_interp_spline(x, y);
+    let p = b.to_ppoly();
+    for t in linspace(x[0], x[24], 101) { close(p.at(t), b.at(t), 1e-12, "to_ppoly"); }
+    let d = b.derivative(1);
+    let dp = p.derivative(1);
+    for t in linspace(x[0], x[24], 37) { close(d.at(t), dp.at(t), 1e-10, "derivative"); }
+    let a = b.antiderivative(1);
+    close(a.derivative(1).at(1.7), b.at(1.7), 1e-12, "antiderivative round trip");
+    close(b.integrate(x[2]..x[20]), p.integrate(x[2]..x[20]), 1e-12, "integral");
+    close(pkg::splint(x[2]..x[20], b), a.at(x[20]) - a.at(x[2]), 1e-12, "splint");
+    let r = b.roots();
+    for v in r { close(b.at(v), 0.0, 1e-12, "root"); }
+    expect(pkg::sproot(b).len() == r.len(), "sproot");
+    // Periodic extrapolation on a B-spline.
+    let q = b.extrapolate(Extrapolate::Periodic);
+    let w = x[24] - x[0];
+    close(q.at(x[3] + w), b.at(x[3]), 1e-12, "wrap");
+    // A hand-made spline: hat function on knots 0, 1, 2.
+    let h = try! BSpline::new([0, 0, 1, 2, 2], [0, 1, 0], 1);
+    expect(h.at(0.5) == 0.5 && h.at(1.0) == 1.0, "hat");
+    close(h.integrate(0.0..2.0), 1.0, 1e-15, "hat area");
+    expect(throws_kind(|| { _ = try BSpline::new([0, 1, 2], [0, 1, 0], 1); }, "LengthMismatch"), "knot count");
+    expect(throws_kind(|| { _ = try BSpline::new([0, 2, 1, 3, 4], [0, 1, 0], 1); }, "NotSorted"), "knot order");
+}
+
+#[test]
+fn lsq_spline() {
+    let x = sorted(200, 0.0, 10.0, 41);
+    let y = x.map(|t: f64| -> f64 { 0.1 * t ** 3 - t });
+    let t: Vector<f64> = [0, 0, 0, 0, 2.5, 5, 7.5, 10, 10, 10, 10];
+    let s = try! pkg::make_lsq_spline(x, y, t);
+    for v in linspace(0.0, 10.0, 51) { rel(s.at(v), 0.1 * v ** 3 - v, 1e-10, "cubic in the space"); }
+    // Noise: residual no worse than the polynomial fit on the same knots.
+    let noisy = y .+ uniform(200, -0.5, 0.5, 42);
+    let s2 = try! pkg::make_lsq_spline(x, noisy, t);
+    let fp = 0.0;
+    for i in 0..200 { fp += (noisy[i] - s2.at(x[i])) ** 2; }
+    expect(fp < 200.0 * 0.25 / 3.0 * 1.3, f"residual {fp}");
+    // Weights: a zero-noise point with a huge weight is matched.
+    let w = Vector::<f64>::full([200], 1.0);
+    w[100] = 1e6;
+    let s3 = try! pkg::make_lsq_spline(x, noisy, t, 3, w);
+    close(s3.at(x[100]), noisy[100], 1e-3, "weighted");
+    // Schoenberg-Whitney: no data under a basis function.
+    let bad: Vector<f64> = [0, 0, 0, 0, 0.001, 0.002, 10, 10, 10, 10];
+    let few = sorted(10, 5.0, 10.0, 43);
+    expect(throws_kind(|| { _ = try pkg::make_lsq_spline(few, few, bad); }, "Singular"), "SW condition");
+}
+
+#[test]
+fn splrep_smoothing() {
+    let n = 101usize;
+    let x = linspace(0.0, 10.0, n);
+    let truth = f64::sin.(x);
+    let y = truth .+ uniform(n, -0.2, 0.2, 51);
+    // s = 0 interpolates.
+    let s0 = try! pkg::splrep(x, y);
+    for i in 0..n { close(s0.at(x[i]), y[i], 1e-11, "interpolates"); }
+    // Moderate s: residual sum is s to 1%, fewer knots, closer to truth.
+    let sigma2 = 0.04 / 3.0;
+    let target = (n as f64) * sigma2;
+    let s1 = try! pkg::splrep(x, y, s: target);
+    let fp = 0.0;
+    for i in 0..n { fp += (y[i] - s1.at(x[i])) ** 2; }
+    expect((fp - target).abs() <= 0.01 * target, f"fp {fp} vs s {target}");
+    expect(s1.knots().len() < 40, f"{s1.knots().len()} knots");
+    let err = 0.0;
+    for i in 0..n { err = err.max((s1.at(x[i]) - truth[i]).abs()); }
+    expect(err < 0.15, f"distance to the sine {err}");
+    // Huge s: the least-squares cubic, no interior knots.
+    let s2 = try! pkg::splrep(x, y, s: 1e6);
+    expect(s2.knots().len() == 8, "polynomial");
+    // Weights and degrees.
+    let w = Vector::<f64>::full([n], 1.0 / 0.2);
+    let s3 = try! pkg::splrep(x, y, 5, (n as f64), w);
+    expect(s3.degree() == 5, "quintic");
+    let s4 = try! pkg::splrep(x, y, 1, 0.5);
+    expect(s4.degree() == 1, "linear");
+    expect(throws_kind(|| { _ = try pkg::splrep(x, y, 7); }, "BadArgument"), "degree 7");
+    expect(throws_kind(|| { _ = try pkg::splrep(x, y, s: -1.0); }, "BadArgument"), "negative s");
+    let d = pkg::splev(x, s1, 1);
+    expect(d.len() == n, "splev derivative");
+}
+
+#[test]
+fn eval_paths_agree() {
+    let x = sorted(30, 0.0, 3.0, 61);
+    let b = try! pkg::make_interp_spline(x, uniform(30, 0.0, 1.0, 62));
+    let q = uniform(500, -0.5, 3.5, 63);
+    let v = b.eval(q);
+    for i in 0..500 { expect(v[i] == b.at(q[i]), "random order eval = at"); }
+    let s = linspace(-0.5, 3.5, 500);
+    let vs = b.eval(s);
+    for i in 0..500 { expect(vs[i] == b.at(s[i]), "sorted eval = at"); }
+    let m: Array<f64, 2> = Array::from_list(q.to_list(), [20, 25]);
+    expect(b.eval(m)[3, 4] == v[79], "rank 2");
+    expect(b.extrapolate(Extrapolate::Fill(-7.0)).eval(q)[0] == (if q[0] < x[0] || q[0] > x[29] { -7.0 } else { v[0] }), "fill");
+}

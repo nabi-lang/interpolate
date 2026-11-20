@@ -1,0 +1,6 @@
+//! Smoothing noisy samples: penalized cubic splines, Savitzky-Golay
+//! filters and LOWESS.
+
+pub mod lowess;
+pub mod savgol;
+pub mod spline;

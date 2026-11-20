@@ -1,0 +1,87 @@
+// Scattered data: k-d tree build and queries, Delaunay, RBF fit and
+// evaluation, on uniform random points. Items are points (or queries)
+// per call, so items/s reads as points/s.
+
+use pkg::scatter::{Delaunay, KdTree, LinearND, Rbf};
+use core::array::{Array, Matrix};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn cloud(n: usize, d: usize, seed: u64) -> Matrix<f64> {
+    let g = Xoshiro256PlusPlus::seed(seed);
+    let xs: List<f64> = List::with_capacity(n * d);
+    for _ in 0..n * d { xs.push(g.uniform(0.0, 1.0)); }
+    Array::from_list(xs, [n, d])
+}
+
+#[bench]
+fn kdtree_build_1e6_d2(b: Bench) {
+    let p = cloud(1000000, 2, 1);
+    b.set_items(1000000);
+    b.iter(|| try! KdTree::new(black_box(p)));
+}
+
+#[bench]
+fn kdtree_build_1e6_d3(b: Bench) {
+    let p = cloud(1000000, 3, 2);
+    b.set_items(1000000);
+    b.iter(|| try! KdTree::new(black_box(p)));
+}
+
+// 1e5 queries of 8 neighbors in a tree of 1e6, batched (parallel).
+#[bench]
+fn kdtree_knn8_1e5_d3(b: Bench) {
+    let t = try! KdTree::new(cloud(1000000, 3, 3));
+    let q = cloud(100000, 3, 4);
+    b.set_items(100000);
+    b.iter(|| try! t.query(black_box(q), 8));
+}
+
+// The same one query at a time, on one thread.
+#[bench]
+fn kdtree_knn1_single_d2(b: Bench) {
+    let t = try! KdTree::new(cloud(1000000, 2, 5));
+    let q = cloud(1000, 2, 6);
+    b.set_items(1000);
+    b.iter(|| {
+        let s = 0.0;
+        for i in 0..1000 { s += (try! t.knn(q[i], 1)).distances[0]; }
+        s
+    });
+}
+
+#[bench]
+fn delaunay_1e5(b: Bench) {
+    let p = cloud(100000, 2, 7);
+    b.set_items(100000);
+    b.iter(|| try! Delaunay::new(black_box(p)));
+}
+
+#[bench]
+fn linear_nd_eval_1e5(b: Bench) {
+    let p = cloud(100000, 2, 8);
+    let v = p[:, 0] .+ p[:, 1];
+    let f = try! LinearND::new(p, v);
+    let q = cloud(100000, 2, 9) .* 0.98 .+ 0.01;
+    b.set_items(100000);
+    b.iter(|| try! f.eval(black_box(q)));
+}
+
+#[bench]
+fn rbf_fit_1000(b: Bench) {
+    let p = cloud(1000, 2, 10);
+    let v = p[:, 0] .* p[:, 1];
+    b.set_items(1000);
+    b.iter(|| try! Rbf::new(black_box(p), v));
+}
+
+// 1e4 points against 1000 centers (parallel).
+#[bench]
+fn rbf_eval_1e4(b: Bench) {
+    let p = cloud(1000, 2, 11);
+    let f = try! Rbf::new(p, p[:, 0] .* p[:, 1]);
+    let q = cloud(10000, 2, 12);
+    b.set_items(10000);
+    b.iter(|| try! f.eval(black_box(q)));
+}

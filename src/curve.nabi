@@ -1,0 +1,108 @@
+//! The interface of every 1-d interpolant, and what it does outside its
+//! data.
+
+use pkg::data::list;
+use pkg::{BSpline, Barycentric, Chebyshev, Linear, PPoly, Polynomial, Step};
+use core::array::Array;
+
+/// What an interpolant gives outside `[x[0], x[n - 1]]`.
+///
+/// ```nabi
+/// use interpolate::{Curve, Extrapolate};
+///
+/// let f = try interpolate::linear([0, 1], [0, 2]);
+/// assert(f.at(2.0) == 4.0);                                     // Extend
+/// assert(f.extrapolate(Extrapolate::Clamp).at(2.0) == 2.0);
+/// assert(f.extrapolate(Extrapolate::Fill(-1.0)).at(2.0) == -1.0);
+/// assert(f.extrapolate(Extrapolate::Periodic).at(1.5) == 1.0);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Extrapolate {
+    /// Continue the first and last pieces (the default).
+    Extend,
+    /// Hold the end values.
+    Clamp,
+    /// This value, NaN for "no answer".
+    Fill(f64),
+    /// Wrap `x` into the data range with period `x[n - 1] - x[0]`.
+    Periodic,
+}
+
+/// A function of one variable built from data. Every interpolant is
+/// called like a function: `s(x)` at one point, `s(xs)` at every element
+/// of an array of any rank (`xs |> s` and `s.(xs)` too). `at` and `eval`
+/// are the two calls by name, and `func` gives a plain `fn(f64) -> f64`
+/// for an API that wants one.
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use core::array::Vector;
+///
+/// let s = try interpolate::cubic_spline([0, 1, 2, 3], [0, 1, 8, 27]);
+/// let xs: Vector<f64> = [0.5, 1.5];
+/// let ys = s(xs);
+/// assert(ys[1] == s(1.5) && s.at(1.5) == ys[1]);
+/// assert(s([0.5, 1.5]) == ys && s(2) == 8.0);
+/// assert((xs |> s) == ys && s.(xs) == ys);
+/// let f = s.func();
+/// assert(f(1.5) == ys[1]);
+/// ```
+pub trait Curve {
+    /// The value at `x`.
+    fn at(self, x: f64) -> f64;
+
+    /// The value at every element of `xs`, in an array of its shape.
+    fn eval<const N: usize>(self, xs: Array<f64, N>) -> Array<f64, N> {
+        let src = list(xs);
+        let out = List::filled(src.len(), 0.0);
+        for i in 0..src.len() { out[i] = self.at(src[i]); }
+        Array::view_list(out, xs.shape())
+    }
+
+    /// `at` as a function value, for an API that takes `fn(f64) -> f64`
+    /// (`quad`, `List::map`).
+    fn func(self) -> fn(f64) -> f64 { |x: f64| -> f64 { self.at(x) } }
+}
+
+// `s(x)` and `s(xs)` for every curve; the argument picks the impl.
+#[impl_macro(callable)] @macro {
+    ( @rep[sep = ","] { @t: ty } ) => {
+        @for @t {
+            impl ops::Call<f64> for @t {
+                type Output = f64;
+                fn call(self, x: f64) -> f64 { self.at(x) }
+            }
+
+            impl<const N: usize> ops::Call<Array<f64, N>> for @t {
+                type Output = Array<f64, N>;
+                fn call(self, xs: Array<f64, N>) -> Array<f64, N> { self.eval(xs) }
+            }
+        }
+    }
+}
+
+callable!(BSpline, Barycentric, Chebyshev, Linear, PPoly, Polynomial, Step);
+
+/// `x` mapped by `mode` into `[lo, hi]`; `none` when the answer is the
+/// `Fill` value.
+pub(pkg) fn wrap(mode: Extrapolate, x: f64, lo: f64, hi: f64) -> f64? {
+    if x >= lo && x <= hi { return x; }
+    match mode {
+        Extrapolate::Extend => x,
+        Extrapolate::Clamp => if x < lo { lo } else if x > hi { hi } else { x },
+        Extrapolate::Fill(_) => if x.is_nan() { x } else { none },
+        Extrapolate::Periodic => {
+            let p = hi - lo;
+            let t = (x - lo) % p;
+            lo + if t < 0.0 { t + p } else { t }
+        },
+    }
+}
+
+/// The value `wrap` stands for with `none`.
+pub(pkg) fn fill(mode: Extrapolate) -> f64 {
+    match mode {
+        Extrapolate::Fill(v) => v,
+        _ => f64::NAN,
+    }
+}

@@ -1,0 +1,16 @@
+//! Integration: rules for sampled data, adaptive Gauss-Kronrod, Romberg
+//! and Gauss-Legendre for functions, and nested double and triple
+//! integrals.
+
+pub(pkg) mod adaptive;
+pub(pkg) mod sampled;
+
+mod gauss;
+mod multi;
+mod richardson;
+
+pub use adaptive::{Quad, quad};
+pub use gauss::{fixed_quad, gauss_legendre};
+pub use multi::{dblquad, dblquad_over, tplquad, tplquad_over};
+pub use richardson::romberg;
+pub use sampled::{cumulative_trapezoid, romb, simpson, trapezoid};

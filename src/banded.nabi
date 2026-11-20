@@ -1,0 +1,160 @@
+// Banded linear systems: LU with partial pivoting for general band
+// matrices (spline collocation with end conditions) and Cholesky for
+// symmetric positive definite ones (least squares, penalized fits).
+// Both cost O(n w^2) for bandwidth w and solve in O(n w).
+
+use pkg::InterpError;
+
+/// An n x n matrix with `kl` sub- and `ku` superdiagonals. Row `i` keeps
+/// columns `i - kl ..= i + ku + kl`: the extra `kl` hold the fill-in of
+/// row swaps.
+pub(pkg) struct Band {
+    pub(pkg) n: usize;
+    kl: usize;
+    ku: usize;
+    w: usize;
+    a: List<f64>;
+    piv: List<usize>;
+}
+
+impl Band {
+    pub(pkg) fn new(n: usize, kl: usize, ku: usize) -> Band {
+        let w = 2 * kl + ku + 1;
+        Band { n, kl, ku, w, a: List::filled(n * w, 0.0), piv: List::filled(n, 0usize) }
+    }
+
+    #[inline]
+    fn pos(self, i: usize, j: usize) -> usize { i * self.w + (j + self.kl - i) }
+
+    /// Entry (i, j); it must lie in the band.
+    pub(pkg) fn set(self, i: usize, j: usize, v: f64) { self.a[self.pos(i, j)] = v; }
+
+    pub(pkg) fn get(self, i: usize, j: usize) -> f64 {
+        if j + self.kl < i || j > i + self.ku + self.kl { 0.0 } else { self.a[self.pos(i, j)] }
+    }
+
+    /// Factors in place, `P A = L U`; `Singular` names `what` on a zero
+    /// pivot.
+    pub(pkg) fn factor(self, what: str) throws (InterpError) {
+        let n = self.n;
+        let big = 0.0;
+        for v in self.a { big = big.max(v.abs()); }
+        for k in 0..n {
+            let last = (k + self.kl).min(n - 1);
+            let p = k;
+            let pv = self.a[self.pos(k, k)].abs();
+            for i in (k + 1)..=last {
+                let v = self.a[self.pos(i, k)].abs();
+                if v > pv { p = i; pv = v; }
+            }
+            if !(pv > 1e-300 && pv > big * 1e-15 * f64::EPSILON) {
+                throw InterpError::Singular { what: f"{what} (pivot {k})" };
+            }
+            self.piv[k] = p;
+            let right = (k + self.ku + self.kl).min(n - 1);
+            if p != k {
+                for j in k..=right {
+                    let (x, y) = (self.pos(k, j), self.pos(p, j));
+                    let t = self.a[x];
+                    self.a[x] = self.a[y];
+                    self.a[y] = t;
+                }
+            }
+            let d = self.a[self.pos(k, k)];
+            for i in (k + 1)..=last {
+                let ik = self.pos(i, k);
+                let m = self.a[ik] / d;
+                self.a[ik] = m;
+                if m == 0.0 { continue; }
+                let (oi, ok) = (self.pos(i, k), self.pos(k, k));
+                for j in 1..=(right - k) { self.a[oi + j] -= m * self.a[ok + j]; }
+            }
+        }
+    }
+
+    /// Solves with the factors, in place on `b[o + s * i]`, i < n.
+    pub(pkg) fn solve(self, b: List<f64>, o: usize, s: usize) {
+        let n = self.n;
+        for k in 0..n {
+            let p = self.piv[k];
+            if p != k {
+                let t = b[o + s * k];
+                b[o + s * k] = b[o + s * p];
+                b[o + s * p] = t;
+            }
+            let bk = b[o + s * k];
+            if bk == 0.0 { continue; }
+            let last = (k + self.kl).min(n - 1);
+            for i in (k + 1)..=last { b[o + s * i] -= self.a[self.pos(i, k)] * bk; }
+        }
+        let k = n;
+        while k > 0 {
+            k -= 1;
+            let right = (k + self.ku + self.kl).min(n - 1);
+            let ok = self.pos(k, k);
+            let v = b[o + s * k];
+            for j in 1..=(right - k) { v -= self.a[ok + j] * b[o + s * (k + j)]; }
+            b[o + s * k] = v / self.a[ok];
+        }
+    }
+}
+
+/// A symmetric positive definite n x n matrix of half bandwidth `p`,
+/// lower band: row `i` keeps columns `i - p ..= i`.
+pub(pkg) struct SymBand {
+    pub(pkg) n: usize;
+    pub(pkg) p: usize;
+    pub(pkg) a: List<f64>;
+}
+
+impl SymBand {
+    pub(pkg) fn new(n: usize, p: usize) -> SymBand { SymBand { n, p, a: List::filled(n * (p + 1), 0.0) } }
+
+    #[inline]
+    pub(pkg) fn pos(self, i: usize, j: usize) -> usize { i * (self.p + 1) + (j + self.p - i) }
+
+    /// Adds `v` to (i, j) and (j, i), `j <= i`, `i - j <= p`.
+    pub(pkg) fn add(self, i: usize, j: usize, v: f64) { self.a[self.pos(i, j)] += v; }
+
+    pub(pkg) fn get(self, i: usize, j: usize) -> f64 {
+        let (r, c) = if i >= j { (i, j) } else { (j, i) };
+        if r - c > self.p { 0.0 } else { self.a[self.pos(r, c)] }
+    }
+
+    /// Cholesky in place, `A = L L^T`, L in the lower band.
+    pub(pkg) fn factor(self, what: str) throws (InterpError) {
+        let (n, p) = (self.n, self.p);
+        for i in 0..n {
+            let j0 = if i > p { i - p } else { 0 };
+            for j in j0..=i {
+                let s = self.a[self.pos(i, j)];
+                let k0 = if i > p { i - p } else { 0 };
+                for k in k0..j { s -= self.a[self.pos(i, k)] * self.a[self.pos(j, k)]; }
+                if j == i {
+                    if !(s > 0.0) { throw InterpError::Singular { what: f"{what} (not positive definite at {i})" }; }
+                    self.a[self.pos(i, i)] = s.sqrt();
+                } else {
+                    self.a[self.pos(i, j)] = s / self.a[self.pos(j, j)];
+                }
+            }
+        }
+    }
+
+    /// Solves `L L^T x = b` in place.
+    pub(pkg) fn solve(self, b: List<f64>) {
+        let (n, p) = (self.n, self.p);
+        for i in 0..n {
+            let s = b[i];
+            let k0 = if i > p { i - p } else { 0 };
+            for k in k0..i { s -= self.a[self.pos(i, k)] * b[k]; }
+            b[i] = s / self.a[self.pos(i, i)];
+        }
+        let i = n;
+        while i > 0 {
+            i -= 1;
+            let s = b[i];
+            for k in (i + 1)..(i + p + 1).min(n) { s -= self.a[self.pos(k, i)] * b[k]; }
+            b[i] = s / self.a[self.pos(i, i)];
+        }
+    }
+}

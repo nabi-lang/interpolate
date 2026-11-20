@@ -1,0 +1,113 @@
+use pkg::tests::suite::{close, expect, linspace, sorted, throws_kind};
+use core::array::{Array, Matrix, Vector};
+
+#[test]
+fn gradient_quadratics() {
+    let x = linspace(-1.0, 2.0, 16);
+    let y = x .* x .* 2.0 .- x .+ 3.0;
+    let g = try! pkg::gradient(y, 0.2, edge_order: 2);
+    for i in 0..16 { close(g[i], 4.0 * x[i] - 1.0, 1e-12, "uniform, edge 2"); }
+    let g1 = try! pkg::gradient(y, x);
+    for i in 1..15 { close(g1[i], 4.0 * x[i] - 1.0, 1e-12, "uniform interior"); }
+    close(g1[0], (y[1] - y[0]) / 0.2, 1e-12, "edge 1");
+    // Uneven positions: still exact for quadratics.
+    let u = sorted(20, 0.0, 5.0, 3);
+    let v = u .* u .* 0.5 .+ u .* 2.0;
+    let gu = try! pkg::gradient(v, u, edge_order: 2);
+    for i in 0..20 { close(gu[i], u[i] + 2.0, 1e-9, f"uneven at {i}"); }
+    let line = try! pkg::gradient(u .* 3.0, u);
+    for i in 0..20 { close(line[i], 3.0, 1e-12, "line, edge 1"); }
+    let two = try! pkg::gradient(Vector::<f64>::from([1.0, 4.0]), 0.5);
+    expect(two[0] == 6.0 && two[1] == 6.0, "two samples");
+}
+
+#[test]
+fn gradient_errors() {
+    let y = linspace(0.0, 1.0, 5);
+    expect(throws_kind(|| { _ = try pkg::gradient(y, edge_order: 3); }, "BadArgument"), "edge 3");
+    expect(throws_kind(|| { _ = try pkg::gradient(y, linspace(0.0, 1.0, 4)); }, "LengthMismatch"), "lengths");
+    expect(throws_kind(|| { _ = try pkg::gradient(Vector::<f64>::from([1.0, 2.0]), edge_order: 2); }, "TooFewPoints"), "too few");
+    expect(throws_kind(|| { _ = try pkg::gradient(y, 0.0); }, "BadArgument"), "dx 0");
+}
+
+#[test]
+fn gradient_grids() {
+    // f = x^2 + 3 x y on x = 0.5 i, y = 2 j.
+    let a: Matrix<f64> = Array::from_fn([6, 5], |ix: [usize; 2]| -> f64 {
+        let (x, y) = (0.5 * (ix[0] as f64), 2.0 * (ix[1] as f64));
+        x * x + 3.0 * x * y
+    });
+    let g = try! pkg::gradient_nd(a, [0.5, 2.0], edge_order: 2);
+    expect(g.len() == 2 && g[0].shape() == [6, 5], "shapes");
+    for i in 0..6usize {
+        for j in 0..5usize {
+            let (x, y) = (0.5 * (i as f64), 2.0 * (j as f64));
+            close(g[0][i, j], 2.0 * x + 3.0 * y, 1e-12, "d/dx");
+            close(g[1][i, j], 3.0 * x, 1e-12, "d/dy");
+        }
+    }
+    let c: Array<f64, 3> = Array::from_fn([3, 4, 2], |ix: [usize; 3]| -> f64 { (ix[0] as f64) + 10.0 * (ix[1] as f64) - 2.0 * (ix[2] as f64) });
+    let h = try! pkg::gradient_nd(c, [0.5]);
+    expect(h.len() == 3, "rank 3");
+    for v in h[0] { close(v, 2.0, 1e-12, "axis 0"); }
+    for v in h[1] { close(v, 20.0, 1e-12, "axis 1"); }
+    for v in h[2] { close(v, -4.0, 1e-12, "axis 2"); }
+    let v1: Vector<f64> = [0, 1, 4];
+    expect((try! pkg::gradient_nd(v1))[0] == try! pkg::gradient(v1), "rank 1 agrees");
+    expect(throws_kind(|| { _ = try pkg::gradient_nd(c, [1.0, 2.0]); }, "BadArgument"), "spacing count");
+}
+
+fn table(m: usize, x0: f64, s: Vector<f64>, want: List<f64>, what: str) {
+    let w = try! pkg::fd_weights(m, x0, s);
+    for i in 0..want.len() { close(w[i], want[i], 1e-13, f"{what} [{i}]"); }
+}
+
+#[test]
+fn fornberg_tables() {
+    table(1, 0.0, [-2, -1, 0, 1, 2], [1.0 / 12.0, -2.0 / 3.0, 0.0, 2.0 / 3.0, -1.0 / 12.0], "central d1 order 4");
+    table(2, 0.0, [-2, -1, 0, 1, 2], [-1.0 / 12.0, 4.0 / 3.0, -2.5, 4.0 / 3.0, -1.0 / 12.0], "central d2 order 4");
+    table(4, 0.0, [-2, -1, 0, 1, 2], [1.0, -4.0, 6.0, -4.0, 1.0], "central d4");
+    table(1, 0.0, [0, 1, 2], [-1.5, 2.0, -0.5], "forward d1 order 2");
+    table(1, 0.0, [0, 1, 2, 3, 4], [-25.0 / 12.0, 4.0, -3.0, 4.0 / 3.0, -0.25], "forward d1 order 4");
+    table(2, 0.0, [0, 1, 2, 3], [2.0, -5.0, 4.0, -1.0], "forward d2 order 2");
+    table(0, 0.5, [0, 1], [0.5, 0.5], "interpolation");
+    // Uneven stencil: exact on a cubic.
+    let s: Vector<f64> = [-0.3, 0.1, 0.7, 1.6];
+    let w = try! pkg::fd_weights(1, 0.2, s);
+    let d = 0.0;
+    for i in 0..4 { d += w[i] * s[i] ** 3; }
+    close(d, 3.0 * 0.04, 1e-13, "uneven cubic");
+    expect(throws_kind(|| { _ = try pkg::fd_weights(3, 0.0, Vector::<f64>::from([0.0, 1.0, 2.0])); }, "TooFewPoints"), "too few");
+    expect(throws_kind(|| { _ = try pkg::fd_weights(1, 0.0, Vector::<f64>::from([0.0, 1.0, 1.0])); }, "BadArgument"), "repeated");
+}
+
+#[test]
+fn differentiate_orders() {
+    let x = linspace(0.0, 2.0, 21);
+    let y = x .** 4.0;
+    // Accuracy 4: stencils of 5 points, exact for quartics.
+    let d1 = try! pkg::differentiate(y, 0.1, accuracy: 4);
+    for i in 0..21 { close(d1[i], 4.0 * x[i] ** 3, 1e-10, f"d1 at {i}"); }
+    let d3 = try! pkg::differentiate(y, 0.1, deriv: 3);
+    for i in 0..21 { close(d3[i], 24.0 * x[i], 1e-7, f"d3 at {i}"); }
+    let d2 = try! pkg::differentiate(x .* x, 0.1, deriv: 2);
+    for i in 0..21 { close(d2[i], 2.0, 1e-9, f"d2 at {i}"); }
+    let s = linspace(0.0, 1.0, 201);
+    let ds = try! pkg::differentiate(f64::sin.(s), 0.005, accuracy: 6);
+    for i in 0..201 { close(ds[i], s[i].cos(), 1e-11, "sin'"); }
+    expect(throws_kind(|| { _ = try pkg::differentiate(y, accuracy: 3); }, "BadArgument"), "odd accuracy");
+    expect(throws_kind(|| { _ = try pkg::differentiate(linspace(0.0, 1.0, 3), accuracy: 4); }, "TooFewPoints"), "too few");
+}
+
+#[test]
+fn derivative_of_functions() {
+    let d = try! pkg::derivative(f64::sin, 1.0);
+    close(d.value, 1.0f64.cos(), 1e-12, "sin'");
+    expect((d.value - 1.0f64.cos()).abs() <= 10.0 * d.error + 1e-15, "within error");
+    let e = try! pkg::derivative(f64::exp, 2.0, 2);
+    close(e.value, 2.0f64.exp(), 1e-8, "exp''");
+    let p = try! pkg::derivative(|x: f64| -> f64 { x ** 3 }, 1e6);
+    close(p.value / 3e12, 1.0, 1e-12, "large x");
+    expect(throws_kind(|| { _ = try pkg::derivative(f64::sin, 0.0, 3); }, "BadArgument"), "n = 3");
+    expect(throws_kind(|| { _ = try pkg::derivative(f64::ln, 0.0); }, "NotFinite"), "ln at 0");
+}

@@ -1,0 +1,544 @@
+//! Power series `c0 + c1 x + ... + cn x^n`, ascending coefficients as in
+//! numpy.polynomial.
+
+use pkg::data::{arg, enough, finite, list, same, vector};
+use pkg::{Curve, InterpError};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+use core::range::Range;
+
+/// A polynomial with real coefficients, lowest power first. Trailing
+/// zeros are dropped, so `==` compares polynomials, not spellings. It is
+/// a `Curve` (`at` is Horner's rule) and takes the arithmetic operators:
+/// `+ - *` with another polynomial or an `f64` on either side, `/` and
+/// `%` (long division), `**` with an integer, `∘` (composition) and
+/// unary `-`.
+///
+/// ```nabi
+/// use interpolate::{Curve, Polynomial};
+///
+/// let p = Polynomial::new([1, -3, 2]);          // 1 - 3x + 2x^2
+/// let x = Polynomial::x();
+/// assert(p == 2.0 * x ** 2 - 3.0 * x + 1.0);
+/// assert(p.at(2.0) == 3.0 && f"{p}" == "1 - 3x + 2x^2");
+/// assert((p ∘ (x + 1.0)).at(1.0) == p.at(2.0));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Polynomial {
+    c: List<f64>;
+}
+
+/// `xs` without trailing zeros, at least one coefficient.
+fn trim(xs: List<f64>) -> Polynomial {
+    let n = xs.len();
+    while n > 1 && xs[n - 1] == 0.0 { n -= 1; }
+    if n == 0 { return Polynomial { c: [0.0] }; }
+    let c = List::with_capacity(n);
+    for i in 0..n { c.push(xs[i]); }
+    Polynomial { c }
+}
+
+impl Polynomial {
+    /// The polynomial with coefficients `coef`, constant term first.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// assert(Polynomial::new([0, 0, 1]).degree() == 2);
+    /// assert(Polynomial::new([5, 0, 0]).degree() == 0);
+    /// ```
+    pub fn new(coef: Vector<f64>) -> Polynomial { trim(list(coef)) }
+
+    /// The constant `v`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Curve, Polynomial};
+    ///
+    /// assert(Polynomial::constant(4.0).at(9.0) == 4.0);
+    /// ```
+    pub fn constant(v: f64) -> Polynomial { Polynomial { c: [v] } }
+
+    /// The identity `x`, for writing polynomials as expressions.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let x = Polynomial::x();
+    /// assert((x * x - 1.0).coefficients()[0] == -1.0);
+    /// ```
+    pub fn x() -> Polynomial { Polynomial { c: [0.0, 1.0] } }
+
+    /// The monic polynomial `(x - r0)(x - r1)...` with the given roots.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let p = Polynomial::from_roots([1, 2]);
+    /// assert(p == Polynomial::new([2, -3, 1]));
+    /// ```
+    pub fn from_roots(roots: Vector<f64>) -> Polynomial {
+        let r = list(roots);
+        let c: List<f64> = [1.0];
+        for z in r {
+            let d = List::filled(c.len() + 1, 0.0);
+            for j in 0..c.len() {
+                d[j + 1] += c[j];
+                d[j] -= z * c[j];
+            }
+            c = d;
+        }
+        trim(c)
+    }
+
+    /// The degree; 0 for a constant, the zero polynomial included.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// assert(Polynomial::new([1, 2, 3]).degree() == 2);
+    /// ```
+    pub fn degree(self) -> usize { self.c.len() - 1 }
+
+    /// The coefficients, constant term first.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// assert(Polynomial::new([1, 2]).coefficients()[1] == 2.0);
+    /// ```
+    pub fn coefficients(self) -> Vector<f64> { vector(self.c.clone()) }
+
+    /// The coefficient of `x^j` (0 past the degree).
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let p = Polynomial::new([1, 2]);
+    /// assert(p.coef(1) == 2.0 && p.coef(7) == 0.0);
+    /// ```
+    pub fn coef(self, j: usize) -> f64 { if j < self.c.len() { self.c[j] } else { 0.0 } }
+
+    /// The `m`-th derivative.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let p = Polynomial::new([1, 1, 1, 1]);
+    /// assert(p.deriv(1) == Polynomial::new([1, 2, 3]));
+    /// assert(p.deriv(4) == Polynomial::constant(0.0));
+    /// ```
+    pub fn deriv(self, m: usize = 1) -> Polynomial {
+        let c = self.c;
+        for _ in 0..m {
+            if c.len() <= 1 { return Polynomial::constant(0.0); }
+            let d = List::filled(c.len() - 1, 0.0);
+            for j in 1..c.len() { d[j - 1] = c[j] * (j as f64); }
+            c = d;
+        }
+        trim(c)
+    }
+
+    /// The `m`-th antiderivative; each integration adds the constant `k`
+    /// (its value at 0).
+    ///
+    /// ```nabi
+    /// use interpolate::{Curve, Polynomial};
+    ///
+    /// let p = Polynomial::new([0, 2]);              // 2x
+    /// assert(p.integ(1) == Polynomial::new([0, 0, 1]));
+    /// assert(p.integ(1, 5.0).at(0.0) == 5.0);
+    /// ```
+    pub fn integ(self, m: usize = 1, k: f64 = 0.0) -> Polynomial {
+        let c = self.c;
+        for _ in 0..m {
+            let d = List::filled(c.len() + 1, 0.0);
+            d[0] = k;
+            for j in 0..c.len() { d[j + 1] = c[j] / ((j + 1) as f64); }
+            c = d;
+        }
+        trim(c)
+    }
+
+    /// The integral from `a` to `b`.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// assert(Polynomial::new([0, 0, 3]).integrate(0.0..2.0) == 8.0);
+    /// ```
+    pub fn integrate(self, r: Range<f64>) -> f64 {
+        let f = self.integ(1);
+        f.at(r.end) - f.at(r.start)
+    }
+
+    /// Every root, complex ones in conjugate pairs: the eigenvalues of
+    /// the companion matrix (Hessenberg QR, via `linalg::eig`), each
+    /// polished by Newton steps that are kept only when they shrink
+    /// `|p|`. Simple roots come out to about `n eps` relative to the
+    /// coefficients; a root of multiplicity m to about `eps^(1/m)`. The
+    /// zero polynomial and constants have no roots.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let r = (try Polynomial::new([1, 0, 1]).roots());    // 1 + x^2
+    /// assert(r.len() == 2 && (r[0].im.abs() - 1.0).abs() < 1e-15 && r[0].re.abs() < 1e-15);
+    /// ```
+    pub fn roots(self) throws (InterpError) -> Vector<Complex<f64>> {
+        try finite(self.c, "polynomial coefficients");
+        // Roots at zero come off first: they make the companion singular
+        // for no benefit.
+        let lo = 0usize;
+        while lo < self.c.len() - 1 && self.c[lo] == 0.0 { lo += 1; }
+        let out: List<Complex<f64>> = [];
+        for _ in 0..lo { out.push(Complex::new(0.0, 0.0)); }
+        let n = self.c.len() - 1 - lo;
+        if n == 0 { return Array::from_list(out, [out.len()]); }
+        let lead = self.c[self.c.len() - 1];
+        if n == 1 {
+            out.push(Complex::new(-self.c[lo] / lead, 0.0));
+            return Array::from_list(out, [out.len()]);
+        }
+        // Companion: ones below the diagonal, -a_j / a_n in the last column.
+        let m: Matrix<f64> = Array::zeros([n, n]);
+        for i in 1..n { m[i, i - 1] = 1.0; }
+        for i in 0..n { m[i, n - 1] = -self.c[lo + i] / lead; }
+        let w = try linalg::eig(balance(m)) catch _: linalg::LinalgError {
+            throw InterpError::NoConvergence { iterations: 30 * n, value: f64::NAN, error: f64::NAN };
+        };
+        let vals = w.values();
+        for z in vals {
+            let r = z;
+            for _ in 0..3 {
+                let (f, df) = self.horner_c(r);
+                if df.norm_sqr() == 0.0 { break; }
+                let next = r - f / df;
+                let (g, _) = self.horner_c(next);
+                if g.norm_sqr() < f.norm_sqr() { r = next; } else { break; }
+            }
+            // Keep a real eigenvalue real.
+            if z.im == 0.0 { r = Complex::new(r.re, 0.0); }
+            out.push(r);
+        }
+        Array::from_list(out, [out.len()])
+    }
+
+    /// The real roots, rising: the roots whose imaginary part is below
+    /// `1e-8 (1 + |z|)`, a tolerance that keeps the real ones a
+    /// companion eigensolver spreads off the axis (double roots).
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let r = try Polynomial::from_roots([3, -1, 2]).real_roots();
+    /// assert((r[0] + 1.0).abs() < 1e-14 && (r[2] - 3.0).abs() < 1e-14);
+    /// ```
+    pub fn real_roots(self) throws (InterpError) -> Vector<f64> {
+        let rs = try self.roots();
+        let out: List<f64> = [];
+        for z in rs {
+            if z.im.abs() <= 1e-8 * (1.0 + z.abs()) { out.push(z.re); }
+        }
+        out.sort_by(|a: f64, b: f64| a.total_cmp(b));
+        vector(out)
+    }
+
+    /// `p` and `p'` at a complex point.
+    fn horner_c(self, z: Complex<f64>) -> (Complex<f64>, Complex<f64>) {
+        let k = self.c.len();
+        let f = Complex::new(0.0, 0.0);
+        let df = Complex::new(0.0, 0.0);
+        while k > 0 {
+            k -= 1;
+            df = df * z + f;
+            f = f * z + Complex::new(self.c[k], 0.0);
+        }
+        (f, df)
+    }
+
+    /// The least-squares polynomial of degree `deg` through `(x, y)`.
+    /// The fit runs on `x` mapped to `[-1, 1]` (a well-conditioned
+    /// Vandermonde matrix, solved by pivoted QR in `linalg::lstsq`) and
+    /// the result is mapped back by composition, which costs some
+    /// digits for high degrees on intervals far from the origin; use
+    /// `Chebyshev::fit` there.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let p = try Polynomial::fit([0, 1, 2, 3], [1, 3, 5, 7], 1);
+    /// assert((p.coef(0) - 1.0).abs() < 1e-14 && (p.coef(1) - 2.0).abs() < 1e-14);
+    /// ```
+    pub fn fit(x: Vector<f64>, y: Vector<f64>, deg: usize) throws (InterpError) -> Polynomial {
+        let xs = list(x);
+        let ys = list(y);
+        try same(xs.len(), ys.len(), "x", "y");
+        try enough(xs.len(), deg + 1);
+        try finite(xs, "x");
+        try finite(ys, "y");
+        let (lo, hi) = (xs.min() ?? 0.0, xs.max() ?? 0.0);
+        try arg(hi > lo || deg == 0, "fit needs at least two distinct x values for degree >= 1");
+        let (s, o) = if hi > lo { (2.0 / (hi - lo), -(hi + lo) / (hi - lo)) } else { (1.0, -lo) };
+        let m = xs.len();
+        let v: Matrix<f64> = Array::zeros([m, deg + 1]);
+        for i in 0..m {
+            let u = s * xs[i] + o;
+            let p = 1.0;
+            for j in 0..deg + 1 {
+                v[i, j] = p;
+                p *= u;
+            }
+        }
+        let q = try linalg::lstsq(v, vector(ys.clone())) catch e: linalg::LinalgError {
+            throw InterpError::Singular { what: f"polynomial fit of degree {deg}: {e}" };
+        };
+        let pu = Polynomial::new(q);
+        pu ∘ Polynomial { c: [o, s] }
+    }
+
+    /// Quotient and remainder of long division: `self = q d + r` with
+    /// `deg r < deg d`. A zero divisor is `BadArgument`.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// let p = Polynomial::new([-1, 0, 1]);          // x^2 - 1
+    /// let (q, r) = try p.divmod(Polynomial::new([-1, 1]));
+    /// assert(q == Polynomial::new([1, 1]) && r == Polynomial::constant(0.0));
+    /// ```
+    pub fn divmod(self, d: Polynomial) throws (InterpError) -> (Polynomial, Polynomial) {
+        try arg(!d.is_zero(), "division by the zero polynomial; check the divisor's coefficients");
+        long_div(self, d)
+    }
+
+    /// Whether every coefficient is 0.
+    ///
+    /// ```nabi
+    /// use interpolate::Polynomial;
+    ///
+    /// assert(Polynomial::new([0, 0]).is_zero());
+    /// ```
+    pub fn is_zero(self) -> bool { self.c.len() == 1 && self.c[0] == 0.0 }
+
+    pub(pkg) fn of(c: List<f64>) -> Polynomial { trim(c) }
+
+    pub(pkg) fn raw(self) -> List<f64> { self.c }
+}
+
+/// `D^-1 A D` with D a power-of-2 diagonal that evens out row and column
+/// norms (Parlett and Reinsch 1969): companion matrices of badly scaled
+/// coefficients lose most of their eigenvalue accuracy without it.
+pub(pkg) fn balance(a: Matrix<f64>) -> Matrix<f64> {
+    let n = a.shape()[0];
+    let done = false;
+    let sweeps = 0;
+    while !done && sweeps < 100 {
+        done = true;
+        sweeps += 1;
+        for i in 0..n {
+            let (c, r) = (0.0, 0.0);
+            for j in 0..n {
+                if j != i {
+                    c += a[j, i].abs();
+                    r += a[i, j].abs();
+                }
+            }
+            if c == 0.0 || r == 0.0 { continue; }
+            let (g, f, s) = (r / 2.0, 1.0, c + r);
+            while c < g {
+                f *= 2.0;
+                c *= 4.0;
+            }
+            let g2 = r * 2.0;
+            while c >= g2 {
+                f /= 2.0;
+                c /= 4.0;
+            }
+            if (c + r) / f < 0.95 * s {
+                done = false;
+                for j in 0..n { a[i, j] = a[i, j] / f; }
+                for j in 0..n { a[j, i] = a[j, i] * f; }
+            }
+        }
+    }
+    a
+}
+
+fn long_div(p: Polynomial, d: Polynomial) -> (Polynomial, Polynomial) {
+    let dn = d.c.len() - 1;
+    let r = p.c.clone();
+    if p.c.len() - 1 < dn { return (Polynomial::constant(0.0), p); }
+    let qn = p.c.len() - 1 - dn;
+    let q = List::filled(qn + 1, 0.0);
+    let lead = d.c[dn];
+    let k = qn + 1;
+    while k > 0 {
+        k -= 1;
+        let f = r[k + dn] / lead;
+        q[k] = f;
+        for j in 0..=dn { r[k + j] -= f * d.c[j]; }
+        r[k + dn] = 0.0;
+    }
+    let rem = List::filled(dn.max(1), 0.0);
+    for j in 0..dn { rem[j] = r[j]; }
+    (trim(q), trim(rem))
+}
+
+impl Curve for Polynomial {
+    fn at(self, x: f64) -> f64 {
+        let k = self.c.len() - 1;
+        let s = self.c[k];
+        while k > 0 {
+            k -= 1;
+            s = s * x + self.c[k];
+        }
+        s
+    }
+}
+
+impl Display for Polynomial {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = "";
+        for j in 0..self.c.len() {
+            let a = self.c[j];
+            if a == 0.0 && self.c.len() > 1 { continue; }
+            let m = a.abs();
+            let term = if j == 0 { f"{m}" } else if m == 1.0 { "" } else { f"{m}" };
+            let pow = if j == 0 { "" } else if j == 1 { "x" } else { f"x^{j}" };
+            if s == "" {
+                s = (if a < 0.0 { "-" } else { "" }) + term + pow;
+            } else {
+                s = s + (if a < 0.0 { " - " } else { " + " }) + term + pow;
+            }
+        }
+        if s == "" { s = "0"; }
+        try f.write_str(s)
+    }
+}
+
+fn add(a: List<f64>, b: List<f64>, sign: f64) -> Polynomial {
+    let c = List::filled(a.len().max(b.len()), 0.0);
+    for i in 0..a.len() { c[i] += a[i]; }
+    for i in 0..b.len() { c[i] += sign * b[i]; }
+    trim(c)
+}
+
+fn mul(a: List<f64>, b: List<f64>) -> Polynomial {
+    let c = List::filled(a.len() + b.len() - 1, 0.0);
+    for i in 0..a.len() {
+        for j in 0..b.len() { c[i + j] += a[i] * b[j]; }
+    }
+    trim(c)
+}
+
+fn scale(a: List<f64>, s: f64) -> Polynomial {
+    let c = List::filled(a.len(), 0.0);
+    for i in 0..a.len() { c[i] = a[i] * s; }
+    trim(c)
+}
+
+impl ops::Add for Polynomial {
+    type Output = Polynomial;
+    fn add(self, rhs: Polynomial) -> Polynomial { add(self.c, rhs.c, 1.0) }
+}
+
+impl ops::Add<f64> for Polynomial {
+    type Output = Polynomial;
+    fn add(self, rhs: f64) -> Polynomial { add(self.c, [rhs], 1.0) }
+}
+
+impl ops::Add<Polynomial> for f64 {
+    type Output = Polynomial;
+    fn add(self, rhs: Polynomial) -> Polynomial { add(rhs.c, [self], 1.0) }
+}
+
+impl ops::Sub for Polynomial {
+    type Output = Polynomial;
+    fn sub(self, rhs: Polynomial) -> Polynomial { add(self.c, rhs.c, -1.0) }
+}
+
+impl ops::Sub<f64> for Polynomial {
+    type Output = Polynomial;
+    fn sub(self, rhs: f64) -> Polynomial { add(self.c, [rhs], -1.0) }
+}
+
+impl ops::Sub<Polynomial> for f64 {
+    type Output = Polynomial;
+    fn sub(self, rhs: Polynomial) -> Polynomial { add([self], rhs.c, -1.0) }
+}
+
+impl ops::Mul for Polynomial {
+    type Output = Polynomial;
+    fn mul(self, rhs: Polynomial) -> Polynomial { mul(self.c, rhs.c) }
+}
+
+impl ops::Mul<f64> for Polynomial {
+    type Output = Polynomial;
+    fn mul(self, rhs: f64) -> Polynomial { scale(self.c, rhs) }
+}
+
+impl ops::Mul<Polynomial> for f64 {
+    type Output = Polynomial;
+    fn mul(self, rhs: Polynomial) -> Polynomial { scale(rhs.c, self) }
+}
+
+/// Long division's quotient; a zero divisor panics, as integer `/` does
+/// (`divmod` throws instead).
+impl ops::Div for Polynomial {
+    type Output = Polynomial;
+    #[track_caller]
+    fn div(self, rhs: Polynomial) -> Polynomial {
+        if rhs.is_zero() { panic("polynomial division by zero; use `divmod` to get an error instead"); }
+        long_div(self, rhs).0
+    }
+}
+
+impl ops::Div<f64> for Polynomial {
+    type Output = Polynomial;
+    fn div(self, rhs: f64) -> Polynomial { scale(self.c, 1.0 / rhs) }
+}
+
+/// Long division's remainder; a zero divisor panics as `/` does.
+impl ops::Rem for Polynomial {
+    type Output = Polynomial;
+    #[track_caller]
+    fn rem(self, rhs: Polynomial) -> Polynomial {
+        if rhs.is_zero() { panic("polynomial division by zero; use `divmod` to get an error instead"); }
+        long_div(self, rhs).1
+    }
+}
+
+impl ops::Neg for Polynomial {
+    type Output = Polynomial;
+    fn neg(self) -> Polynomial { scale(self.c, -1.0) }
+}
+
+/// `p ** n` by repeated squaring.
+impl ops::Pow<u32> for Polynomial {
+    type Output = Polynomial;
+    fn pow(self, n: u32) -> Polynomial {
+        let r = Polynomial::constant(1.0);
+        let b = self;
+        let e = n;
+        while e > 0 {
+            if e & 1 == 1 { r = r * b; }
+            e >>= 1;
+            if e > 0 { b = b * b; }
+        }
+        r
+    }
+}
+
+/// `(p ∘ q)(x) = p(q(x))`, by Horner's rule on polynomials.
+impl ops::Compose<Polynomial> for Polynomial {
+    type Output = Polynomial;
+    fn compose(self, q: Polynomial) -> Polynomial {
+        let k = self.c.len() - 1;
+        let r = Polynomial::constant(self.c[k]);
+        while k > 0 {
+            k -= 1;
+            r = r * q + self.c[k];
+        }
+        r
+    }
+}

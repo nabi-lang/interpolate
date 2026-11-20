@@ -1,0 +1,14 @@
+//! Scattered data in any dimension: a k-d tree, robust predicates, the
+//! 2-d Delaunay triangulation, and interpolants on top of them.
+
+pub mod delaunay;
+pub mod kdtree;
+pub mod linear;
+pub mod predicates;
+pub mod rbf;
+
+pub use delaunay::Delaunay;
+pub use kdtree::{KdTree, Neighbors};
+pub use linear::{LinearND, Method, NearestND, griddata};
+pub use predicates::{incircle, orient2d};
+pub use rbf::{Kernel, Rbf};

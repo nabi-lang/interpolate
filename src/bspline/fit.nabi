@@ -1,0 +1,223 @@
+// Spline fits with given or chosen knots: interpolation by collocation
+// (banded LU) and weighted least squares (banded normal equations,
+// Cholesky). The collocation matrix of distinct sites meeting the
+// Schoenberg-Whitney conditions is nonsingular and totally positive
+// (de Boor), so the band solve is stable.
+
+use pkg::banded::{Band, SymBand};
+use pkg::bspline::basis::{basis, ders, span};
+use pkg::data::{arg, enough, finite, list, pairs, same};
+use pkg::{BSpline, Boundary, InterpError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// The interpolating B-spline of degree `k` (default 3) through the
+/// samples, scipy's `make_interp_spline`. Knots: `k = 0` steps at the
+/// data, `k = 1` the data, odd `k` not-a-knot (interior knots at the data
+/// with the `(k - 1) / 2` nearest each end left out), even `k` the
+/// midpoints between samples, likewise trimmed. `bc` other than
+/// `NotAKnot` needs `k = 3` (the data as knots and one derivative
+/// condition at each end); `Periodic` is `cubic_spline_with`'s job.
+/// O(n k^2).
+///
+/// ```nabi
+/// use interpolate::{Boundary, Curve};
+///
+/// let b = try interpolate::make_interp_spline([0, 1, 2, 3, 4], [0, 1, 16, 81, 256], 4);
+/// assert((b.at(2.5) - 39.0625).abs() < 1e-11);              // x^4, degree 4
+/// let n = try interpolate::make_interp_spline([0, 1, 2], [0, 1, 0], 3, Boundary::Natural);
+/// assert(n.derivative(2).at(0.0).abs() < 1e-14);
+/// ```
+pub fn make_interp_spline<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, k: usize = 3, bc: Boundary = Boundary::NotAKnot) throws (InterpError) -> BSpline {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let (xs, ys) = try pairs(x, y, 1);
+    let n = xs.len();
+    if k == 0 {
+        try arg(bc == Boundary::NotAKnot, "degree 0 takes no end conditions");
+        let t = xs.clone();
+        t.push(xs[n - 1]);
+        if n == 1 { t[1] = xs[0] + 1.0; }
+        return BSpline::raw(t, ys.clone(), 0);
+    }
+    try enough(n, if bc == Boundary::NotAKnot { k + 1 } else { 2 });
+    if k == 1 {
+        try arg(bc == Boundary::NotAKnot, "degree 1 takes no end conditions");
+        let t: List<f64> = [xs[0]];
+        for v in xs { t.push(v); }
+        t.push(xs[n - 1]);
+        return BSpline::raw(t, ys.clone(), 1);
+    }
+    if bc != Boundary::NotAKnot {
+        try arg(k == 3, "end conditions other than NotAKnot need k = 3; use cubic_spline_with for a periodic spline");
+        try arg(bc != Boundary::Periodic, "make_interp_spline has no periodic form; use cubic_spline_with(x, y, Boundary::Periodic)");
+        return try with_ends(xs, ys, bc);
+    }
+    let t = interp_knots(xs, k);
+    let a = try collocation(xs, t, k);
+    let c = ys.clone();
+    a.solve(c, 0, 1);
+    BSpline::raw(t, c, k)
+}
+
+/// The not-a-knot knots of `make_interp_spline` for `n >= k + 1` sites,
+/// `k >= 2`.
+pub(pkg) fn interp_knots(xs: List<f64>, k: usize) -> List<f64> {
+    let n = xs.len();
+    let t: List<f64> = [];
+    for _ in 0..=k { t.push(xs[0]); }
+    if k % 2 == 1 {
+        let m = (k - 1) / 2;
+        for i in (m + 1)..(n - m - 1) { t.push(xs[i]); }
+    } else {
+        // Midpoints, k / 2 left out at each end.
+        let h = k / 2;
+        for i in h..(n - 1 - h) { t.push(0.5 * (xs[i] + xs[i + 1])); }
+    }
+    for _ in 0..=k { t.push(xs[n - 1]); }
+    t
+}
+
+/// The factored square collocation matrix `B[i, j] = B_j(xs[i])` on
+/// knots `t`.
+pub(pkg) fn collocation(xs: List<f64>, t: List<f64>, k: usize) throws (InterpError) -> Band {
+    let n = xs.len();
+    let a = Band::new(n, k, k);
+    let b = List::filled(k + 1, 0.0);
+    let (lw, rw) = (List::filled(k + 1, 0.0), List::filled(k + 1, 0.0));
+    for i in 0..n {
+        let l = span(t, k, n, xs[i]);
+        basis(t, k, l, xs[i], b, lw, rw);
+        for r in 0..=k { a.set(i, l - k + r, b[r]); }
+    }
+    try a.factor("spline collocation; the samples are too close for the degree");
+    a
+}
+
+/// The cubic with the data as knots and one derivative condition at each
+/// end (`n + 2` coefficients).
+fn with_ends(xs: List<f64>, ys: List<f64>, bc: Boundary) throws (InterpError) -> BSpline {
+    let n = xs.len();
+    let k = 3usize;
+    let t: List<f64> = [xs[0], xs[0], xs[0]];
+    for v in xs { t.push(v); }
+    for _ in 0..3 { t.push(xs[n - 1]); }
+    let nc = n + 2;
+    let ((nl, vl), (nr, vr)) = match bc {
+        Boundary::Natural => ((2usize, 0.0), (2usize, 0.0)),
+        Boundary::Clamped => ((1usize, 0.0), (1usize, 0.0)),
+        Boundary::Slopes(a, b) => ((1usize, a), (1usize, b)),
+        Boundary::Curvatures(a, b) => ((2usize, a), (2usize, b)),
+        _ => ((1usize, 0.0), (1usize, 0.0)),
+    };
+    let a = Band::new(nc, k + 1, k + 1);
+    let rhs = List::filled(nc, 0.0);
+    let d = ders(t, k, k, xs[0], nl);
+    for r in 0..=k { a.set(0, r, d[r]); }
+    rhs[0] = vl;
+    let b = List::filled(k + 1, 0.0);
+    let (lw, rw) = (List::filled(k + 1, 0.0), List::filled(k + 1, 0.0));
+    for i in 0..n {
+        let l = span(t, k, nc, xs[i]);
+        basis(t, k, l, xs[i], b, lw, rw);
+        for r in 0..=k { a.set(i + 1, l - k + r, b[r]); }
+        rhs[i + 1] = ys[i];
+    }
+    let d = ders(t, k, nc - 1, xs[n - 1], nr);
+    for r in 0..=k { a.set(nc - 1, nc - 1 - k + r, d[r]); }
+    rhs[nc - 1] = vr;
+    try a.factor("cubic spline end conditions");
+    a.solve(rhs, 0, 1);
+    BSpline::raw(t, rhs, k)
+}
+
+/// The weighted least-squares spline of degree `k` on the knots `t`
+/// (scipy's `make_lsq_spline`): minimizes `sum (w[i] (y[i] - s(x[i])))^2`.
+/// The data must meet the Schoenberg-Whitney conditions (each basis
+/// function has a sample where it is nonzero, in order), else the
+/// normal equations are singular. Banded Cholesky, O(m k^2).
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0, 1, 2, 3, 4, 5, 6];
+/// let y = x .* x;                                   // a parabola, exactly
+/// let t: Vector<f64> = [0, 0, 0, 0, 3, 6, 6, 6, 6];
+/// let s = try interpolate::make_lsq_spline(x, y, t);
+/// assert((s.at(2.5) - 6.25).abs() < 1e-12);
+/// ```
+pub fn make_lsq_spline<X: AsVector<f64>, Y: AsVector<f64>, T: AsVector<f64>>(x: X, y: Y, t: T, k: usize = 3, w: Vector<f64> | none = none) throws (InterpError) -> BSpline {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    let t: Vector<f64> = t.as_vector();
+    let (xs, ys) = try pairs(x, y, k + 1);
+    let ts = list(t).clone();
+    try finite(ts, "t");
+    for i in 1..ts.len() {
+        if ts[i] < ts[i - 1] { throw InterpError::NotSorted { at: i }; }
+    }
+    try arg(ts.len() >= 2 * k + 2, f"need at least 2 k + 2 = {2 * k + 2} knots, got {ts.len()}");
+    let ws = match w {
+        none => List::filled(xs.len(), 1.0),
+        v: Vector<f64> => list(v),
+    };
+    try same(xs.len(), ws.len(), "x", "w");
+    try finite(ws, "w");
+    let c = try lsq(xs, ys, ws, ts, k, 0.0, List::filled(0, 0.0));
+    BSpline::raw(ts, c, k)
+}
+
+/// The coefficients minimizing `sum (w (y - s))^2 + rho sum_q jump_q^2`,
+/// where `jump_q` is the jump of the k-th derivative at interior knot q
+/// (`jumps` from `jump_rows`, empty when `rho == 0`).
+pub(pkg) fn lsq(xs: List<f64>, ys: List<f64>, ws: List<f64>, t: List<f64>, k: usize, rho: f64, jumps: List<f64>) throws (InterpError) -> List<f64> {
+    let nc = t.len() - k - 1;
+    let a = SymBand::new(nc, k + 1);
+    let rhs = List::filled(nc, 0.0);
+    let b = List::filled(k + 1, 0.0);
+    let (lw, rw) = (List::filled(k + 1, 0.0), List::filled(k + 1, 0.0));
+    for i in 0..xs.len() {
+        let l = span(t, k, nc, xs[i]);
+        basis(t, k, l, xs[i], b, lw, rw);
+        let w2 = ws[i] * ws[i];
+        for r in 0..=k {
+            let ir = l - k + r;
+            rhs[ir] += w2 * b[r] * ys[i];
+            for q in 0..=r { a.add(ir, l - k + q, w2 * b[r] * b[q]); }
+        }
+    }
+    if rho > 0.0 {
+        // Row q of the jumps covers coefficients q .. q + k + 1.
+        let nq = jumps.len() / (k + 2);
+        for q in 0..nq {
+            for r in 0..k + 2 {
+                for s in 0..=r { a.add(q + r, q + s, rho * jumps[q * (k + 2) + r] * jumps[q * (k + 2) + s]); }
+            }
+        }
+    }
+    try a.factor("least-squares spline; some basis function has no sample under it (Schoenberg-Whitney); move or drop knots");
+    a.solve(rhs);
+    rhs
+}
+
+/// The jumps of the k-th derivative of the basis functions at each
+/// interior knot: row q (knot `t[k + 1 + q]`) holds k + 2 values for
+/// coefficients q .. q + k + 1.
+pub(pkg) fn jump_rows(t: List<f64>, k: usize) -> List<f64> {
+    let nc = t.len() - k - 1;
+    let ni = nc - k - 1;
+    let out = List::filled(ni * (k + 2), 0.0);
+    for q in 0..ni {
+        let l = k + 1 + q;
+        // Spans l - 1 and l hold the k-th derivative on either side.
+        let right = ders(t, k, l, 0.5 * (t[l] + t[l + 1]), k);
+        let left = ders(t, k, l - 1, 0.5 * (t[l - 1] + t[l]), k);
+        // Coefficient index j: right covers l - k .. l, left l - 1 - k .. l - 1.
+        for r in 0..=k {
+            out[q * (k + 2) + r + 1] += right[r];
+            out[q * (k + 2) + r] -= left[r];
+        }
+    }
+    out
+}

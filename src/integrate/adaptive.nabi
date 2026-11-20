@@ -1,0 +1,540 @@
+// Adaptive quadrature after QUADPACK (Piessens, de Doncker-Kapenga,
+// Ueberhuber, Kahaner 1983): QAGS, global bisection of the interval
+// with the largest error under a 21-point Gauss-Kronrod rule, sped up
+// by Wynn's epsilon algorithm on the sequence of sums, which handles
+// endpoint and interior singularities; QAGI maps an infinite range
+// onto (0, 1] and uses the 15-point rule. The arrays are 1-based, as
+// in the Fortran, to keep the transcription checkable.
+
+use pkg::InterpError;
+use core::range::Range;
+
+/// The result of an adaptive integration: the estimate, an estimate of
+/// its absolute error, the integrand evaluations it took and the
+/// subintervals it ended with.
+///
+/// ```nabi
+/// let q = try interpolate::quad(|x: f64| -> f64 { x * x }, 0.0..3.0);
+/// assert((q.value - 9.0).abs() <= q.error && q.error < 1e-12);
+/// assert(q.evals == 21 && q.intervals == 1);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Quad {
+    /// The integral.
+    pub value: f64;
+    /// An estimate of `|value - exact|`.
+    pub error: f64;
+    /// Integrand evaluations.
+    pub evals: usize;
+    /// Subintervals at the end.
+    pub intervals: usize;
+}
+
+const XGK21: [f64; 11] = [
+    0.995657163025808080735527280689003, 0.973906528517171720077964012084452,
+    0.930157491355708226001207180059508, 0.865063366688984510732096688423493,
+    0.780817726586416897063717578345042, 0.679409568299024406234327365114874,
+    0.562757134668604683339000099272694, 0.433395394129247190799265943165784,
+    0.294392862701460198131126603103866, 0.148874338981631210884826001129720,
+    0.0,
+];
+const WGK21: [f64; 11] = [
+    0.011694638867371874278064396062192, 0.032558162307964727478818972459390,
+    0.054755896574351996031381300244580, 0.075039674810919952767043140916190,
+    0.093125454583697605535065465083366, 0.109387158802297641899210590325805,
+    0.123491976262065851077208977222900, 0.134709217311473325928054001771707,
+    0.142775938577060080797094273138717, 0.147739104901338491374841515972068,
+    0.149445554002916905664936468389821,
+];
+const WG10: [f64; 5] = [
+    0.066671344308688137593568809893332, 0.149451349150580593145776339657697,
+    0.219086362515982043995534934228163, 0.269266719309996355091226921569469,
+    0.295524224714752870173892994651338,
+];
+const XGK15: [f64; 8] = [
+    0.991455371120812639206854697526329, 0.949107912342758524526189684047851,
+    0.864864423359769072789712788640926, 0.741531185599394439863864773280788,
+    0.586087235467691130294144845693013, 0.405845151377397166906606412076961,
+    0.207784955007898467600689403773245, 0.0,
+];
+const WGK15: [f64; 8] = [
+    0.022935322010529224963732008058970, 0.063092092629978553290700663189204,
+    0.104790010322250183839876322541518, 0.140653259715525918745189590510238,
+    0.169004726639267902826583426598550, 0.190350578064785409913256402421014,
+    0.204432940075298892414161999234649, 0.209482141084727828012999174891714,
+];
+const WG7: [f64; 8] = [
+    0.0, 0.129484966168869693270611432679082,
+    0.0, 0.279705391489276667901467771423780,
+    0.0, 0.381830050505118944950369775488975,
+    0.0, 0.417959183673469387755102040816327,
+];
+
+const EPMACH: f64 = 2.220446049250313e-16;
+const UFLOW: f64 = 2.2250738585072014e-308;
+const OFLOW: f64 = 1.7976931348623157e308;
+
+/// One rule application: (result, abserr, resabs, resasc).
+struct Rule {
+    r: f64;
+    e: f64;
+    abs: f64;
+    asc: f64;
+}
+
+/// QUADPACK's error scaling of a rule.
+fn scaled(resk: f64, resg: f64, hl: f64, resabs: f64, resasc: f64) -> Rule {
+    let dh = hl.abs();
+    let (ra, rs) = (resabs * dh, resasc * dh);
+    let err = ((resk - resg) * hl).abs();
+    if rs != 0.0 && err != 0.0 { err = rs * (200.0 * err / rs).pow(1.5).min(1.0); }
+    if ra > UFLOW / (50.0 * EPMACH) { err = err.max(EPMACH * 50.0 * ra); }
+    Rule { r: resk * hl, e: err, abs: ra, asc: rs }
+}
+
+/// 21-point Kronrod rule with the embedded 10-point Gauss rule on [a, b].
+fn qk21(f: fn(f64) -> f64, a: f64, b: f64) -> Rule {
+    let c = 0.5 * (a + b);
+    let hl = 0.5 * (b - a);
+    let fv1 = [0.0; 10];
+    let fv2 = [0.0; 10];
+    let fc = f(c);
+    let resg = 0.0;
+    let resk = WGK21[10] * fc;
+    let resabs = resk.abs();
+    for j in 0..5 {
+        let jt = 2 * j + 1;
+        let x = hl * XGK21[jt];
+        let (f1, f2) = (f(c - x), f(c + x));
+        fv1[jt] = f1;
+        fv2[jt] = f2;
+        resg += WG10[j] * (f1 + f2);
+        resk += WGK21[jt] * (f1 + f2);
+        resabs += WGK21[jt] * (f1.abs() + f2.abs());
+    }
+    for j in 0..5 {
+        let jt = 2 * j;
+        let x = hl * XGK21[jt];
+        let (f1, f2) = (f(c - x), f(c + x));
+        fv1[jt] = f1;
+        fv2[jt] = f2;
+        resk += WGK21[jt] * (f1 + f2);
+        resabs += WGK21[jt] * (f1.abs() + f2.abs());
+    }
+    let h = resk * 0.5;
+    let resasc = WGK21[10] * (fc - h).abs();
+    for j in 0..10 { resasc += WGK21[j] * ((fv1[j] - h).abs() + (fv2[j] - h).abs()); }
+    scaled(resk, resg, hl, resabs, resasc)
+}
+
+/// 15-point Kronrod rule on [a, b] within (0, 1] for the integral of
+/// `f` from `boun` to infinity (`inf` 1), from minus infinity to `boun`
+/// (`inf` -1) or over the whole line (`inf` 2, `boun` 0), with
+/// `x = boun + s (1 - t) / t`.
+fn qk15i(f: fn(f64) -> f64, boun: f64, inf: i32, a: f64, b: f64) -> Rule {
+    let dinf = if inf < 0 { -1.0 } else { 1.0 };
+    let c = 0.5 * (a + b);
+    let hl = 0.5 * (b - a);
+    let g = |t: f64| -> f64 {
+        let x = boun + dinf * (1.0 - t) / t;
+        let v = f(x);
+        if inf == 2 { v += f(-x); }
+        v / t / t
+    };
+    let fv1 = [0.0; 7];
+    let fv2 = [0.0; 7];
+    let fc = g(c);
+    let resg = WG7[7] * fc;
+    let resk = WGK15[7] * fc;
+    let resabs = resk.abs();
+    for j in 0..7 {
+        let x = hl * XGK15[j];
+        let (f1, f2) = (g(c - x), g(c + x));
+        fv1[j] = f1;
+        fv2[j] = f2;
+        resg += WG7[j] * (f1 + f2);
+        resk += WGK15[j] * (f1 + f2);
+        resabs += WGK15[j] * (f1.abs() + f2.abs());
+    }
+    let h = resk * 0.5;
+    let resasc = WGK15[7] * (fc - h).abs();
+    for j in 0..7 { resasc += WGK15[j] * ((fv1[j] - h).abs() + (fv2[j] - h).abs()); }
+    scaled(resk, resg, hl, resabs, resasc)
+}
+
+/// The epsilon table of Wynn's algorithm (QUADPACK's QELG).
+struct Eps {
+    tab: List<f64>;
+    n: usize;
+    res3: List<f64>;
+    nres: usize;
+}
+
+impl Eps {
+    fn new() -> Eps { Eps { tab: List::filled(53, 0.0), n: 0, res3: List::filled(4, 0.0), nres: 0 } }
+
+    /// Extrapolates the sequence in `tab[1..=n]`: (result, abserr).
+    fn step(ref self) -> (f64, f64) {
+        let e = self.tab;
+        self.nres += 1;
+        let abserr = OFLOW;
+        let n = self.n;
+        let result = e[n];
+        if n < 3 {
+            return (result, abserr.max(5.0 * EPMACH * result.abs()));
+        }
+        let limexp = 50usize;
+        e[n + 2] = e[n];
+        let newelm = (n - 1) / 2;
+        e[n] = OFLOW;
+        let num = n;
+        let k1 = n;
+        let broke = false;
+        for i in 1..=newelm {
+            let k2 = k1 - 1;
+            let k3 = k1 - 2;
+            let res = e[k1 + 2];
+            let e0 = e[k3];
+            let e1 = e[k2];
+            let e2 = res;
+            let e1abs = e1.abs();
+            let delta2 = e2 - e1;
+            let err2 = delta2.abs();
+            let tol2 = e2.abs().max(e1abs) * EPMACH;
+            let delta3 = e1 - e0;
+            let err3 = delta3.abs();
+            let tol3 = e1abs.max(e0.abs()) * EPMACH;
+            if err2 <= tol2 && err3 <= tol3 {
+                // e0, e1, e2 agree to machine precision: converged.
+                self.n = n;
+                return (res, (err2 + err3).max(5.0 * EPMACH * res.abs()));
+            }
+            let e3 = e[k1];
+            e[k1] = e1;
+            let delta1 = e1 - e3;
+            let err1 = delta1.abs();
+            let tol1 = e1abs.max(e3.abs()) * EPMACH;
+            if err1 <= tol1 || err2 <= tol2 || err3 <= tol3 {
+                n = i + i - 1;
+                broke = true;
+                break;
+            }
+            let ss = 1.0 / delta1 + 1.0 / delta2 - 1.0 / delta3;
+            let epsinf = (ss * e1).abs();
+            if !(epsinf > 1e-4) {
+                n = i + i - 1;
+                broke = true;
+                break;
+            }
+            let r = e1 + 1.0 / ss;
+            e[k1] = r;
+            k1 -= 2;
+            let error = err2 + (r - e2).abs() + err3;
+            if error <= abserr {
+                abserr = error;
+                result = r;
+            }
+        }
+        let _ = broke;
+        if n == limexp { n = 2 * (limexp / 2) - 1; }
+        let ib = if num % 2 == 0 { 2usize } else { 1usize };
+        for _ in 1..=newelm + 1 {
+            e[ib] = e[ib + 2];
+            ib += 2;
+        }
+        if num != n {
+            let indx = num - n + 1;
+            for i in 1..=n {
+                e[i] = e[indx];
+                indx += 1;
+            }
+        }
+        self.n = n;
+        if self.nres < 4 {
+            self.res3[self.nres] = result;
+            abserr = OFLOW;
+        } else {
+            let r3 = self.res3;
+            abserr = (result - r3[3]).abs() + (result - r3[2]).abs() + (result - r3[1]).abs();
+            r3[1] = r3[2];
+            r3[2] = r3[3];
+            r3[3] = result;
+        }
+        (result, abserr.max(5.0 * EPMACH * result.abs()))
+    }
+}
+
+/// QUADPACK's QPSRT: keeps `iord` ordered by falling error; returns the
+/// new (maxerr, errmax, nrmax).
+fn qpsrt(limit: usize, last: usize, maxerr: usize, elist: List<f64>, iord: List<usize>, nrmax: usize) -> (usize, usize) {
+    if last <= 2 {
+        iord[1] = 1;
+        iord[2] = 2;
+        return (iord[nrmax], nrmax);
+    }
+    let errmax = elist[maxerr];
+    let nr = nrmax;
+    if nr != 1 {
+        for _ in 1..nr {
+            let isucc = iord[nr - 1];
+            if errmax <= elist[isucc] { break; }
+            iord[nr] = isucc;
+            nr -= 1;
+        }
+    }
+    let jupbn = if last > limit / 2 + 2 { limit + 3 - last } else { last };
+    let errmin = elist[last];
+    let jbnd = jupbn - 1;
+    let ibeg = nr + 1;
+    let placed = false;
+    if ibeg <= jbnd {
+        for i in ibeg..=jbnd {
+            let isucc = iord[i];
+            if errmax >= elist[isucc] {
+                iord[i - 1] = maxerr;
+                let k = jbnd;
+                let done = false;
+                for _ in i..=jbnd {
+                    let s = iord[k];
+                    if errmin < elist[s] {
+                        iord[k + 1] = last;
+                        done = true;
+                        break;
+                    }
+                    iord[k + 1] = s;
+                    k -= 1;
+                }
+                if !done { iord[i] = last; }
+                placed = true;
+                break;
+            }
+            iord[i - 1] = isucc;
+        }
+    }
+    if !placed {
+        iord[jbnd] = maxerr;
+        iord[jupbn] = last;
+    }
+    (iord[nr], nr)
+}
+
+/// The QAGS / QAGI driver over [a, b] with `rule`; `n` evaluations a
+/// rule. Returns (result, abserr, last, ier).
+fn qags(rule: fn(f64, f64) -> Rule, a: f64, b: f64, epsabs: f64, epsrel: f64, limit: usize) -> (f64, f64, usize, usize) {
+    let alist = List::filled(limit + 2, 0.0);
+    let blist = List::filled(limit + 2, 0.0);
+    let rlist = List::filled(limit + 2, 0.0);
+    let elist = List::filled(limit + 2, 0.0);
+    let iord = List::filled(limit + 2, 0usize);
+    alist[1] = a;
+    blist[1] = b;
+    let ier = 0usize;
+    let ierro = 0usize;
+    let first = rule(a, b);
+    let (result, abserr, defabs, resabs) = (first.r, first.e, first.abs, first.asc);
+    let dres = result.abs();
+    let errbnd = epsabs.max(epsrel * dres);
+    let last = 1usize;
+    rlist[1] = result;
+    elist[1] = abserr;
+    iord[1] = 1;
+    if abserr <= 100.0 * EPMACH * defabs && abserr > errbnd { ier = 2; }
+    if limit == 1 { ier = 1; }
+    if ier != 0 || (abserr <= errbnd && abserr != resabs) || abserr == 0.0 {
+        return (result, abserr, last, ier);
+    }
+    let eps = Eps::new();
+    eps.tab[1] = result;
+    let errmax = abserr;
+    let maxerr = 1usize;
+    let area = result;
+    let errsum = abserr;
+    abserr = OFLOW;
+    let nrmax = 1usize;
+    eps.n = 2;
+    let ktmin = 0usize;
+    let extrap = false;
+    let noext = false;
+    let (iroff1, iroff2, iroff3) = (0usize, 0usize, 0usize);
+    let ksgn: i32 = if dres >= (1.0 - 50.0 * EPMACH) * defabs { 1 } else { -1 };
+    let (small, erlarg, ertest, correc) = (0.0, 0.0, 0.0, 0.0);
+    // How the loop ended: 0 ran out (goto 100 via ier), 1 errsum small (115).
+    let sum_up = false;
+    for l in 2..=limit {
+        last = l;
+        let a1 = alist[maxerr];
+        let b1 = 0.5 * (alist[maxerr] + blist[maxerr]);
+        let a2 = b1;
+        let b2 = blist[maxerr];
+        let erlast = errmax;
+        let r1 = rule(a1, b1);
+        let r2 = rule(a2, b2);
+        let (area1, error1, defab1) = (r1.r, r1.e, r1.asc);
+        let (area2, error2, defab2) = (r2.r, r2.e, r2.asc);
+        let area12 = area1 + area2;
+        let erro12 = error1 + error2;
+        errsum = errsum + erro12 - errmax;
+        area = area + area12 - rlist[maxerr];
+        if defab1 != error1 && defab2 != error2 {
+            if (rlist[maxerr] - area12).abs() <= 1e-5 * area12.abs() && erro12 >= 0.99 * errmax {
+                if extrap { iroff2 += 1; } else { iroff1 += 1; }
+            }
+            if last > 10 && erro12 > errmax { iroff3 += 1; }
+        }
+        rlist[maxerr] = area1;
+        rlist[last] = area2;
+        errbnd = epsabs.max(epsrel * area.abs());
+        if iroff1 + iroff2 >= 10 || iroff3 >= 20 { ier = 2; }
+        if iroff2 >= 5 { ierro = 3; }
+        if last == limit { ier = 1; }
+        if a1.abs().max(b2.abs()) <= (1.0 + 100.0 * EPMACH) * (a2.abs() + 1000.0 * UFLOW) { ier = 4; }
+        if error2 > error1 {
+            alist[maxerr] = a2;
+            alist[last] = a1;
+            blist[last] = b1;
+            rlist[maxerr] = area2;
+            rlist[last] = area1;
+            elist[maxerr] = error2;
+            elist[last] = error1;
+        } else {
+            alist[last] = a2;
+            blist[maxerr] = b1;
+            blist[last] = b2;
+            elist[maxerr] = error1;
+            elist[last] = error2;
+        }
+        let (mx, nr) = qpsrt(limit, last, maxerr, elist, iord, nrmax);
+        maxerr = mx;
+        nrmax = nr;
+        errmax = elist[maxerr];
+        if errsum <= errbnd {
+            sum_up = true;
+            break;
+        }
+        if ier != 0 { break; }
+        if last == 2 {
+            small = (b - a).abs() * 0.375;
+            erlarg = errsum;
+            ertest = errbnd;
+            eps.tab[2] = area;
+            continue;
+        }
+        if noext { continue; }
+        erlarg -= erlast;
+        if (b1 - a1).abs() > small { erlarg += erro12; }
+        if !extrap {
+            // Bisect the smallest interval first.
+            if (blist[maxerr] - alist[maxerr]).abs() > small { continue; }
+            extrap = true;
+            nrmax = 2;
+        }
+        let skip = false;
+        if ierro != 3 && erlarg > ertest {
+            // Bisect the large intervals before extrapolating again.
+            let jupbnd = if last > 2 + limit / 2 { limit + 3 - last } else { last };
+            for _ in nrmax..=jupbnd {
+                maxerr = iord[nrmax];
+                errmax = elist[maxerr];
+                if (blist[maxerr] - alist[maxerr]).abs() > small {
+                    skip = true;
+                    break;
+                }
+                nrmax += 1;
+            }
+        }
+        if skip { continue; }
+        eps.n += 1;
+        eps.tab[eps.n] = area;
+        let (reseps, abseps) = eps.step();
+        ktmin += 1;
+        if ktmin > 5 && abserr < 1e-3 * errsum { ier = 5; }
+        if abseps < abserr {
+            ktmin = 0;
+            abserr = abseps;
+            result = reseps;
+            correc = erlarg;
+            ertest = epsabs.max(epsrel * reseps.abs());
+            if abserr <= ertest { break; }
+        }
+        if eps.n == 1 { noext = true; }
+        if ier == 5 { break; }
+        maxerr = iord[1];
+        errmax = elist[maxerr];
+        nrmax = 1;
+        extrap = false;
+        small *= 0.5;
+        erlarg = errsum;
+    }
+    // Label 100: pick the extrapolated or the summed result.
+    let use_sum = sum_up || abserr == OFLOW;
+    let check_div = false;
+    if !use_sum && ier + ierro != 0 {
+        if ierro == 3 { abserr += correc; }
+        if ier == 0 { ier = 3; }
+        if result != 0.0 && area != 0.0 {
+            if abserr / result.abs() > errsum / area.abs() { use_sum = true; } else { check_div = true; }
+        } else if abserr > errsum {
+            use_sum = true;
+        } else if area != 0.0 {
+            check_div = true;
+        }
+    } else if !use_sum {
+        check_div = true;
+    }
+    if check_div && !(ksgn == -1 && result.abs().max(area.abs()) <= defabs * 0.01) {
+        if 0.01 > result / area || result / area > 100.0 || errsum > area.abs() { ier = 6; }
+    }
+    if use_sum {
+        result = 0.0;
+        for k in 1..=last { result += rlist[k]; }
+        abserr = errsum;
+    }
+    if ier > 2 { ier -= 1; }
+    (result, abserr, last, ier)
+}
+
+/// The integral of `f` over `r` by adaptive Gauss-Kronrod quadrature
+/// with extrapolation (QUADPACK's QAGS; QAGI when an end is infinite,
+/// `f64::INFINITY` / `f64::NEG_INFINITY`). It stops when the error
+/// estimate is at most `max(epsabs, epsrel |value|)`, after at most
+/// `limit` bisections. Endpoint singularities such as `x^-1/2` or
+/// `ln x` and integrable interior ones near a bisection point are
+/// handled; for a known interior trouble spot, split the range there.
+/// `r.start > r.end` gives the negative. Throws `NoConvergence` (with
+/// the best estimate) when the tolerance is not met: the limit is
+/// reached, roundoff stops progress, the integrand misbehaves or the
+/// integral seems to diverge; `NotFinite` when `f` gives NaN or an
+/// infinity.
+///
+/// ```nabi
+/// let q = try interpolate::quad(|x: f64| -> f64 { 1.0 / x.sqrt() }, 0.0..1.0);
+/// assert((q.value - 2.0).abs() <= q.error && q.error < 1e-10);
+/// let g = try interpolate::quad(|x: f64| -> f64 { (-x * x).exp() }, f64::NEG_INFINITY..f64::INFINITY);
+/// assert((g.value - f64::PI.sqrt()).abs() < 1e-12);
+/// ```
+pub fn quad(f: fn(f64) -> f64, r: Range<f64>, epsabs: f64 = 1.49e-8, epsrel: f64 = 1.49e-8, limit: usize = 50) throws (InterpError) -> Quad {
+    let (a, b) = (r.start, r.end);
+    if a.is_nan() || b.is_nan() { throw InterpError::NotFinite { what: "the range" }; }
+    if !(epsabs > 0.0 || epsrel >= (50.0 * EPMACH).max(5e-29)) {
+        throw InterpError::BadArgument { what: f"tolerances epsabs {epsabs}, epsrel {epsrel} cannot be met; give epsabs > 0 or epsrel >= 1.2e-14" };
+    }
+    if limit < 1 { throw InterpError::BadArgument { what: "limit must be at least 1 (the default is 50)" }; }
+    if a == b { return Quad { value: 0.0, error: 0.0, evals: 0, intervals: 0 }; }
+    if a > b {
+        let q = try quad(f, b..a, epsabs, epsrel, limit);
+        return Quad { value: -q.value, error: q.error, evals: q.evals, intervals: q.intervals };
+    }
+    let (value, error, last, ier, per) = if a.is_finite() && b.is_finite() {
+        let (v, e, l, i) = qags(|lo: f64, hi: f64| -> Rule { qk21(f, lo, hi) }, a, b, epsabs, epsrel, limit);
+        (v, e, l, i, 21usize)
+    } else {
+        let (boun, inf) = if a.is_finite() { (a, 1) } else if b.is_finite() { (b, -1) } else { (0.0, 2) };
+        let (v, e, l, i) = qags(|lo: f64, hi: f64| -> Rule { qk15i(f, boun, inf, lo, hi) }, 0.0, 1.0, epsabs, epsrel, limit);
+        (v, e, l, i, if inf == 2 { 30usize } else { 15usize })
+    };
+    if !value.is_finite() || !error.is_finite() {
+        throw InterpError::NotFinite { what: f"the integrand (the estimate is {value})" };
+    }
+    if ier != 0 { throw InterpError::NoConvergence { iterations: last, value, error }; }
+    Quad { value, error, evals: per * (2 * last - 1), intervals: last }
+}

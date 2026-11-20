@@ -1,0 +1,221 @@
+// Smoothing splines with automatic knots, after Dierckx's FITPACK
+// `curfit` ("Curve and Surface Fitting with Splines", 1993, ch. 5): add
+// knots where the residuals are largest until the least-squares spline
+// is within the smoothing target `s`, then trade fit for smoothness
+// (the jumps of the k-th derivative) until the residual sum is `s`.
+
+use pkg::bspline::fit::{jump_rows, lsq, make_interp_spline};
+use pkg::data::{arg, finite, list, pairs, same};
+use pkg::{BSpline, InterpError};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// A smoothing spline of degree `k` (1 to 5, default 3), FITPACK's
+/// `splrep`: the spline with the fewest knots and the least roughness
+/// whose weighted residual sum `sum (w[i] (y[i] - s(x[i])))^2` is at most
+/// `s`. `s = 0` (the default) interpolates; with weights `1 / sigma[i]`
+/// a good `s` is in `m - sqrt(2 m) ..= m + sqrt(2 m)` for `m` samples.
+/// Larger `s` gives a smoother curve; past the residual of the
+/// least-squares polynomial of degree `k` the answer is that polynomial.
+/// Knots are data points, so the fit always exists; O(m k^2) per trial
+/// fit, a few dozen trials.
+///
+/// ```nabi
+/// use interpolate::Curve;
+/// use core::array::Vector;
+///
+/// let x = Vector::<f64>::from(num::linspace(0.0, 6.0, 61));
+/// let y = f64::sin.(x) .+ 0.1 .* f64::cos.(x .* 37.0);       // a wiggle on a sine
+/// let s = try interpolate::splrep(x, y, s: 0.3);
+/// assert(s.knots().len() < 20);
+/// assert((s.at(1.5) - 1.5.sin()).abs() < 0.05);
+/// ```
+pub fn splrep<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, k: usize = 3, s: f64 = 0.0, w: Vector<f64> | none = none) throws (InterpError) -> BSpline {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    try arg(k >= 1 && k <= 5, f"splrep takes degree 1 to 5, got {k}");
+    try arg(s >= 0.0 && s.is_finite(), f"the smoothing target s must be finite and >= 0, got {s}");
+    let (xs, ys) = try pairs(x, y, k + 1);
+    let m = xs.len();
+    let ws = match w {
+        none => List::filled(m, 1.0),
+        v: Vector<f64> => list(v),
+    };
+    try same(m, ws.len(), "x", "w");
+    try finite(ws, "w");
+    for v in ws { try arg(v > 0.0, "weights must be positive"); }
+    if s == 0.0 { return try make_interp_spline(x, y, k); }
+    let acc = 0.001 * s;
+    // Interior knots, rising, all data points.
+    let inner: List<f64> = [];
+    let t = knots(xs, inner, k);
+    let c = try lsq(xs, ys, ws, t, k, 0.0, []);
+    let fp = residual(xs, ys, ws, t, c, k);
+    if fp <= s { return BSpline::raw(t, c, k); }
+    let fpold = fp;
+    let nplus = 1usize;
+    let first = true;
+    // At most the interpolating knot count.
+    let nmax = m - k - 1;
+    loop {
+        if fp - s < acc { return BSpline::raw(t, c, k); }
+        if inner.len() >= nmax { break; }
+        if !first {
+            let rn = nplus as f64;
+            let npl1 = if fpold - fp > acc { (rn * (fp - s) / (fpold - fp)) as usize } else { nplus * 2 };
+            nplus = (nplus * 2).min(npl1.max(nplus / 2).max(1));
+        }
+        first = false;
+        fpold = fp;
+        let res = resid_list(xs, ys, ws, t, c, k);
+        let added = 0usize;
+        for _ in 0..nplus {
+            if inner.len() >= nmax { break; }
+            let at = split(xs, res, inner) ?? break;
+            insert(inner, at);
+            added += 1;
+        }
+        if added == 0 { break; }
+        t = knots(xs, inner, k);
+        c = try lsq(xs, ys, ws, t, k, 0.0, []);
+        fp = residual(xs, ys, ws, t, c, k);
+        if fp <= s { break; }
+    }
+    if (fp - s).abs() <= acc { return BSpline::raw(t, c, k); }
+    if fp > s {
+        // Interpolation is the best these knots can do.
+        return BSpline::raw(t, c, k);
+    }
+    // fp(rho) rises from fp (rho = 0) to fp0 (rho -> inf): solve fp = s
+    // in log rho, bracketing then Illinois steps.
+    let jumps = jump_rows(t, k);
+    let f = |lr: f64| -> f64 {
+        let cc = try! lsq(xs, ys, ws, t, k, lr.exp(), jumps);
+        residual(xs, ys, ws, t, cc, k) - s
+    };
+    // A starting rho balancing the two terms.
+    let (bt, jt) = (weight_sum(ws), jump_sum(jumps));
+    let lo = (bt / jt.max(f64::MIN_POSITIVE)).ln();
+    let flo = f(lo);
+    let hi = lo;
+    let fhi = flo;
+    if flo > 0.0 {
+        for _ in 0..60 {
+            hi = lo;
+            fhi = flo;
+            lo -= 2.3;
+            flo = f(lo);
+            if flo <= 0.0 { break; }
+        }
+    } else {
+        for _ in 0..60 {
+            lo = hi;
+            flo = fhi;
+            hi += 2.3;
+            fhi = f(hi);
+            if fhi >= 0.0 { break; }
+        }
+    }
+    if flo > 0.0 || fhi < 0.0 {
+        throw InterpError::NoConvergence { iterations: 60, value: fp, error: (fp - s).abs() };
+    }
+    let side = 0;
+    for it in 0..80 {
+        let mid = (lo * fhi - hi * flo) / (fhi - flo);
+        let fm = f(mid);
+        if fm.abs() <= acc || it == 79 {
+            let cc = try lsq(xs, ys, ws, t, k, mid.exp(), jumps);
+            return BSpline::raw(t, cc, k);
+        }
+        if fm < 0.0 {
+            lo = mid;
+            flo = fm;
+            if side == -1 { fhi *= 0.5; }
+            side = -1;
+        } else {
+            hi = mid;
+            fhi = fm;
+            if side == 1 { flo *= 0.5; }
+            side = 1;
+        }
+    }
+    BSpline::raw(t, c, k)
+}
+
+/// The full knot vector: the ends repeated k + 1 times around `inner`.
+fn knots(xs: List<f64>, inner: List<f64>, k: usize) -> List<f64> {
+    let t: List<f64> = [];
+    for _ in 0..=k { t.push(xs[0]); }
+    for v in inner { t.push(v); }
+    for _ in 0..=k { t.push(xs[xs.len() - 1]); }
+    t
+}
+
+fn resid_list(xs: List<f64>, ys: List<f64>, ws: List<f64>, t: List<f64>, c: List<f64>, k: usize) -> List<f64> {
+    let b = BSpline::raw(t, c, k);
+    let out = List::filled(xs.len(), 0.0);
+    for i in 0..xs.len() {
+        let r = ws[i] * (ys[i] - b.raw_at(xs[i]));
+        out[i] = r * r;
+    }
+    out
+}
+
+fn residual(xs: List<f64>, ys: List<f64>, ws: List<f64>, t: List<f64>, c: List<f64>, k: usize) -> f64 {
+    let r = resid_list(xs, ys, ws, t, c, k);
+    let s = 0.0;
+    for v in r { s += v; }
+    s
+}
+
+/// The data point to add as a knot: the middle sample strictly inside
+/// the knot interval with the largest residual sum, or `none` when no
+/// interval has a sample to spare.
+fn split(xs: List<f64>, res: List<f64>, inner: List<f64>) -> f64? {
+    let m = xs.len();
+    let edges: List<f64> = [xs[0]];
+    for v in inner { edges.push(v); }
+    edges.push(xs[m - 1]);
+    let best = -1.0;
+    let pick: f64? = none;
+    let i = 0usize;
+    for j in 0..edges.len() - 1 {
+        let (a, b) = (edges[j], edges[j + 1]);
+        let sum = 0.0;
+        let first = m;
+        let count = 0usize;
+        while i < m && xs[i] < b {
+            if xs[i] > a {
+                if first == m { first = i; }
+                count += 1;
+            }
+            sum += res[i];
+            i += 1;
+        }
+        // A sample at the right edge counts on both sides.
+        if i < m && xs[i] == b { sum += 0.5 * res[i]; }
+        if count >= 1 && sum > best {
+            best = sum;
+            pick = xs[first + (count - 1) / 2];
+        }
+    }
+    pick
+}
+
+/// `v` into the rising list `xs`.
+fn insert(xs: List<f64>, v: f64) {
+    let p = xs.partition_point(|q: f64| q < v);
+    xs.insert(p, v);
+}
+
+fn weight_sum(ws: List<f64>) -> f64 {
+    let s = 0.0;
+    for v in ws { s += v * v; }
+    s
+}
+
+fn jump_sum(j: List<f64>) -> f64 {
+    let s = 0.0;
+    for v in j { s += v * v; }
+    s
+}

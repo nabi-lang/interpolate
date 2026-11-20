@@ -1,0 +1,256 @@
+// Interpolation on rectilinear grids of any rank: multilinear, nearest
+// and tensor-product cubic splines (scipy's RegularGridInterpolator).
+
+use pkg::curve::{fill, wrap};
+use pkg::data::{enough, finite, interval, list, rising, same, vector};
+use pkg::{Extrapolate, InterpError, TensorSpline};
+use core::array::{Array, Matrix, Vector};
+use linalg::AsVector;
+
+/// How `RegularGrid` interpolates between grid points.
+///
+/// ```nabi
+/// use interpolate::GridMethod;
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [0, 1];
+/// let z: Matrix<f64> = [[0, 1], [2, 3]];
+/// let g = try interpolate::grid([x, x], z, GridMethod::Nearest);
+/// assert(g.at([0.4, 0.6]) == 1.0);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GridMethod {
+    /// Multilinear (bilinear in 2-d): exact for functions linear in
+    /// each coordinate; C0.
+    Linear,
+    /// The value at the closest grid point (the lower one at a tie).
+    Nearest,
+    /// A tensor-product not-a-knot cubic spline (lower degree along an
+    /// axis of fewer than 4 points); C2, exact for cubics in each
+    /// coordinate.
+    Cubic,
+}
+
+/// An interpolant of values on a rectilinear grid of rank `N`: axis `d`
+/// has rising coordinates `axes[d]`, and `values` has their lengths as
+/// its shape. Call it at a point, `g([x, y])` (or `g.at(..)`). Linear
+/// and nearest cost O(N log n + 2^N) per point, cubic O(N log n + 4^N)
+/// after an O(n_total) fit.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [0, 1, 2];
+/// let y: Vector<f64> = [0, 10];
+/// let z: Matrix<f64> = [[0, 10], [1, 11], [2, 12]];      // z = x + y
+/// let g = try interpolate::bilinear(x, y, z);
+/// assert(g([1.5, 2.5]) == 4.0);
+/// ```
+#[derive(Clone)]
+pub struct RegularGrid<const N: usize> {
+    axes: List<List<f64>>;
+    shape: [usize; N];
+    stride: [usize; N];
+    v: List<f64>;
+    method: GridMethod;
+    mode: Extrapolate;
+    spline: TensorSpline<N>?;
+}
+
+/// The interpolant of `values` on the grid with coordinates `axes` (each
+/// rising strictly, with at least 2 points; 1 point for `Nearest`).
+/// Outside the grid it extends the edge cells (`Extrapolate::Extend`);
+/// set another mode with `extrapolate`.
+///
+/// ```nabi
+/// use interpolate::GridMethod;
+/// use core::array::{Array, Vector};
+///
+/// let x: Vector<f64> = [0, 1, 2, 3];
+/// let v = Array::from_fn([4, 4, 4], |i: [usize; 3]| -> f64 { (i[0] * i[1] + i[2]) as f64 });
+/// let g = try interpolate::grid([x, x, x], v, GridMethod::Linear);
+/// assert(g.at([1.5, 2.0, 0.5]) == 3.5);
+/// ```
+pub fn grid<const N: usize>(axes: [Vector<f64>; N], values: Array<f64, N>, method: GridMethod = GridMethod::Linear) throws (InterpError) -> RegularGrid<N> {
+    let shape = values.shape();
+    let ax: List<List<f64>> = [];
+    for d in 0..N {
+        let a = list(axes[d]).clone();
+        try same(shape[d], a.len(), f"values axis {d}", f"axes[{d}]");
+        try enough(a.len(), if method == GridMethod::Nearest { 1 } else { 2 });
+        try finite(a, f"axes[{d}]");
+        try rising(a);
+        ax.push(a);
+    }
+    let v = values.to_list();
+    try finite(v, "values");
+    let spline: TensorSpline<N>? = if method == GridMethod::Cubic { try TensorSpline::fit(axes, values, 3) } else { none };
+    let stride = [1usize; N];
+    let d = N;
+    let s = 1usize;
+    while d > 0 {
+        d -= 1;
+        stride[d] = s;
+        s *= shape[d];
+    }
+    RegularGrid { axes: ax, shape, stride, v, method, mode: Extrapolate::Extend, spline }
+}
+
+/// The bilinear interpolant of `z` (shape `[x.len(), y.len()]`) on the
+/// grid `x` by `y`.
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [0, 1];
+/// let z: Matrix<f64> = [[0, 0], [0, 1]];              // z = x y
+/// assert((try interpolate::bilinear(x, x, z)).at([0.5, 0.5]) == 0.25);
+/// ```
+pub fn bilinear<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, z: Matrix<f64>) throws (InterpError) -> RegularGrid<2> {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    try grid([x, y], z, GridMethod::Linear)
+}
+
+impl<const N: usize> RegularGrid<N> {
+    /// This interpolant with extrapolation `mode`, applied per axis.
+    ///
+    /// ```nabi
+    /// use interpolate::Extrapolate;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1];
+    /// let z: Matrix<f64> = [[0, 1], [1, 2]];
+    /// let g = try interpolate::bilinear(x, x, z);
+    /// assert(g.at([2.0, 0.0]) == 2.0);
+    /// assert(g.extrapolate(Extrapolate::Clamp).at([2.0, 0.0]) == 1.0);
+    /// assert(g.extrapolate(Extrapolate::Fill(f64::NAN)).at([2.0, 0.0]).is_nan());
+    /// ```
+    pub fn extrapolate(self, mode: Extrapolate) -> RegularGrid<N> {
+        let s = self.spline;
+        RegularGrid { axes: self.axes, shape: self.shape, stride: self.stride, v: self.v, method: self.method, mode, spline: s?.extrapolate(mode) }
+    }
+
+    /// The method.
+    pub fn method(self) -> GridMethod { self.method }
+
+    /// The value at `p`.
+    ///
+    /// ```nabi
+    /// use interpolate::GridMethod;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] * i[0] * i[1]) as f64 });
+    /// let g = try interpolate::grid([x, x], z, GridMethod::Cubic);
+    /// assert((g.at([1.5, 2.5]) - 5.625).abs() < 1e-12);            // x^2 y, exactly
+    /// ```
+    pub fn at(self, p: [f64; N]) -> f64 {
+        match self.spline {
+            s: TensorSpline<N> => return s.at(p),
+            none => {},
+        }
+        let q = p;
+        for d in 0..N {
+            let a = self.axes[d];
+            q[d] = wrap(self.mode, p[d], a[0], a[a.len() - 1]) ?? return fill(self.mode);
+            if q[d].is_nan() { return f64::NAN; }
+        }
+        if self.method == GridMethod::Nearest { return self.nearest(q); }
+        self.linear(q)
+    }
+
+    fn nearest(self, q: [f64; N]) -> f64 {
+        let off = 0usize;
+        for d in 0..N {
+            let a = self.axes[d];
+            let i = if a.len() == 1 { 0 } else {
+                let j = interval(a, q[d]);
+                if q[d] - a[j] <= a[j + 1] - q[d] { j } else { j + 1 }
+            };
+            off = off * self.shape[d] + i;
+        }
+        self.v[off]
+    }
+
+    fn linear(self, q: [f64; N]) -> f64 {
+        let w = [0.0; N];
+        let base = 0usize;
+        for d in 0..N {
+            let a = self.axes[d];
+            let i = interval(a, q[d]);
+            base += i * self.stride[d];
+            w[d] = (q[d] - a[i]) / (a[i + 1] - a[i]);
+        }
+        let sum = 0.0;
+        for corner in 0..(1usize << N) {
+            let f = 1.0;
+            let off = base;
+            for d in 0..N {
+                if (corner >> d) & 1 == 1 {
+                    f *= w[d];
+                    off += self.stride[d];
+                } else {
+                    f *= 1.0 - w[d];
+                }
+            }
+            if f != 0.0 { sum += f * self.v[off]; }
+        }
+        sum
+    }
+
+    /// The values at the points in the rows of `points` (m x N).
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1];
+    /// let z: Matrix<f64> = [[0, 1], [1, 2]];
+    /// let g = try interpolate::bilinear(x, x, z);
+    /// let p: Matrix<f64> = [[0.5, 0.5], [1, 0.25]];
+    /// assert(try g.eval(p) == Vector::<f64>::from([1.0, 1.25]));
+    /// ```
+    pub fn eval(self, points: Matrix<f64>) throws (InterpError) -> Vector<f64> {
+        let s = points.shape();
+        try same(s[1], N, "each point", "grid axes");
+        let ps = list(points);
+        let out = List::filled(s[0], 0.0);
+        let p = [0.0; N];
+        for i in 0..s[0] {
+            for d in 0..N { p[d] = ps[i * N + d]; }
+            out[i] = self.at(p);
+        }
+        vector(out)
+    }
+
+    /// The values on the mesh of `axes`: an array of shape
+    /// `[axes[0].len(), ...]` (the outer product of the coordinates).
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1];
+    /// let z: Matrix<f64> = [[0, 1], [1, 2]];
+    /// let fine: Vector<f64> = [0, 0.5, 1];
+    /// let m = (try interpolate::bilinear(x, x, z)).mesh([fine, fine]);
+    /// assert(m.shape() == [3, 3] && m[1, 1] == 1.0);
+    /// ```
+    pub fn mesh(self, axes: [Vector<f64>; N]) -> Array<f64, N> {
+        let shape = [0usize; N];
+        let ax: List<List<f64>> = [];
+        for d in 0..N {
+            shape[d] = axes[d].len();
+            ax.push(list(axes[d]));
+        }
+        Array::from_fn(shape, |i: [usize; N]| -> f64 {
+            let p = [0.0; N];
+            for d in 0..N { p[d] = ax[d][i[d]]; }
+            self.at(p)
+        })
+    }
+}
+
+impl<const N: usize> ops::Call<[f64; N]> for RegularGrid<N> {
+    type Output = f64;
+    fn call(self, p: [f64; N]) -> f64 { self.at(p) }
+}

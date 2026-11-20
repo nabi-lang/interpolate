@@ -1,0 +1,104 @@
+// The B-spline basis: knot spans, the k + 1 nonzero basis functions and
+// their derivatives at a point (Piegl and Tiller, "The NURBS Book",
+// algorithms A2.1-A2.3).
+
+/// The span `l` of the knots `t` with `t[l] <= x < t[l + 1]`, clamped to
+/// `k..=n - 1` (`n` coefficients), so the end pieces extend outside the
+/// base interval `[t[k], t[n]]`. Binary search.
+pub(pkg) fn span(t: List<f64>, k: usize, n: usize, x: f64) -> usize {
+    if !(x >= t[k + 1]) { return k; }
+    if x >= t[n - 1] { return n - 1; }
+    let (lo, hi) = (k + 1, n - 1);
+    // t[lo] <= x < t[hi]
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if x >= t[mid] { lo = mid; } else { hi = mid; }
+    }
+    lo
+}
+
+/// `B[l - k + r](x)` for r in 0..=k into `out[0..=k]`; `left` and
+/// `right` are scratch of k + 1. The Cox-de Boor recurrence, stable
+/// (only sums of nonnegative terms inside the span).
+pub(pkg) fn basis(t: List<f64>, k: usize, l: usize, x: f64, out: List<f64>, left: List<f64>, right: List<f64>) {
+    out[0] = 1.0;
+    for j in 1..=k {
+        left[j] = x - t[l + 1 - j];
+        right[j] = t[l + j] - x;
+        let saved = 0.0;
+        for r in 0..j {
+            let tmp = out[r] / (right[r + 1] + left[j - r]);
+            out[r] = saved + right[r + 1] * tmp;
+            saved = left[j - r] * tmp;
+        }
+        out[j] = saved;
+    }
+}
+
+/// The `nu`-th derivatives (nu <= k) of the k + 1 nonzero basis
+/// functions at `x` in span `l`: a list of k + 1 values.
+pub(pkg) fn ders(t: List<f64>, k: usize, l: usize, x: f64, nu: usize) -> List<f64> {
+    let p = k;
+    let w = p + 1;
+    // ndu[j * w + r]: knot differences below the diagonal, basis values
+    // on and above it.
+    let ndu = List::filled(w * w, 0.0);
+    let left = List::filled(w, 0.0);
+    let right = List::filled(w, 0.0);
+    ndu[0] = 1.0;
+    for j in 1..=p {
+        left[j] = x - t[l + 1 - j];
+        right[j] = t[l + j] - x;
+        let saved = 0.0;
+        for r in 0..j {
+            ndu[j * w + r] = right[r + 1] + left[j - r];
+            let tmp = ndu[r * w + j - 1] / ndu[j * w + r];
+            ndu[r * w + j] = saved + right[r + 1] * tmp;
+            saved = left[j - r] * tmp;
+        }
+        ndu[j * w + j] = saved;
+    }
+    let out = List::filled(w, 0.0);
+    if nu == 0 {
+        for j in 0..=p { out[j] = ndu[j * w + p]; }
+        return out;
+    }
+    if nu > p { return out; }
+    let a = List::filled(2 * w, 0.0);
+    for r in 0..=p {
+        let (s1, s2) = (0usize, w);
+        a[0] = 1.0;
+        let d = 0.0;
+        for kk in 1..=nu {
+            d = 0.0;
+            let rk = r as isize - kk as isize;
+            let pk = p - kk;
+            if rk >= 0 {
+                a[s2] = a[s1] / ndu[(pk + 1) * w + rk as usize];
+                d = a[s2] * ndu[rk as usize * w + pk];
+            }
+            let j1: isize = if rk >= -1 { 1 } else { -rk };
+            let j2: isize = if r as isize - 1 <= pk as isize { kk as isize - 1 } else { (p - r) as isize };
+            let j = j1;
+            while j <= j2 {
+                let ju = j as usize;
+                let rj = (rk + j) as usize;
+                a[s2 + ju] = (a[s1 + ju] - a[s1 + ju - 1]) / ndu[(pk + 1) * w + rj];
+                d += a[s2 + ju] * ndu[rj * w + pk];
+                j += 1;
+            }
+            if r <= pk {
+                a[s2 + kk] = -a[s1 + kk - 1] / ndu[(pk + 1) * w + r];
+                d += a[s2 + kk] * ndu[r * w + pk];
+            }
+            let tmp = s1;
+            s1 = s2;
+            s2 = tmp;
+        }
+        out[r] = d;
+    }
+    let f = 1.0;
+    for m in 0..nu { f *= (p - m) as f64; }
+    for j in 0..=p { out[j] *= f; }
+    out
+}

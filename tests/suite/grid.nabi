@@ -1,0 +1,81 @@
+use pkg::tests::suite::{close, expect, linspace, rel, sorted, throws_kind, uniform};
+use pkg::{Extrapolate, GridMethod, TensorSpline};
+use core::array::{Array, Matrix, Vector};
+
+#[test]
+fn multilinear_exact() {
+    let x = sorted(7, 0.0, 2.0, 1);
+    let y = sorted(5, -1.0, 1.0, 2);
+    let f = |a: f64, b: f64| -> f64 { 1.0 + 2.0 * a - b + 0.5 * a * b };
+    let z = Matrix::<f64>::from_fn([7, 5], |i: [usize; 2]| -> f64 { f(x[i[0]], y[i[1]]) });
+    let g = try! pkg::bilinear(x, y, z);
+    let px = uniform(100, -0.5, 2.5, 3);
+    let py = uniform(100, -1.5, 1.5, 4);
+    for i in 0..100 { close(g.at([px[i], py[i]]), f(px[i], py[i]), 1e-12, "bilinear, extended"); }
+    // Rank 3 and 4.
+    let a = sorted(4, 0.0, 1.0, 5);
+    let v3 = Array::from_fn([4, 4, 4], |i: [usize; 3]| -> f64 { a[i[0]] * a[i[1]] * a[i[2]] - a[i[2]] });
+    let g3 = try! pkg::grid([a, a, a], v3);
+    for t in linspace(0.0, 1.0, 9) { close(g3.at([t, 0.5, 1.0 - t]), t * 0.5 * (1.0 - t) - (1.0 - t), 1e-12, "trilinear"); }
+    let v4 = Array::from_fn([4, 4, 4, 4], |i: [usize; 4]| -> f64 { a[i[0]] + a[i[1]] * a[i[3]] - a[i[2]] });
+    let g4 = try! pkg::grid([a, a, a, a], v4);
+    close(g4.at([0.3, 0.4, 0.5, 0.6]), 0.3 + 0.24 - 0.5, 1e-12, "rank 4");
+    let one = try! pkg::grid([a], Array::from_fn([4], |i: [usize; 1]| -> f64 { 3.0 * a[i[0]] }));
+    close(one.at([0.25]), 0.75, 1e-15, "rank 1");
+}
+
+#[test]
+fn nearest_and_modes() {
+    let x: Vector<f64> = [0, 1, 2];
+    let z: Matrix<f64> = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+    let g = try! pkg::grid([x, x], z, GridMethod::Nearest);
+    expect(g.at([0.4, 1.6]) == 3.0 && g.at([1.5, 0.5]) == 4.0 && g.at([9.0, -9.0]) == 7.0, "nearest");
+    let l = try! pkg::bilinear(x, x, z);
+    expect(l.extrapolate(Extrapolate::Clamp).at([5.0, 5.0]) == 9.0, "clamp");
+    expect(l.extrapolate(Extrapolate::Fill(0.0)).at([0.0, 2.5]) == 0.0, "fill");
+    expect(l.at([3.0, 0.0]) == 10.0, "extend");
+    let pts: Matrix<f64> = [[0.5, 0.5], [2, 2]];
+    let v = try! l.eval(pts);
+    expect(v[0] == 3.0 && v[1] == 9.0, "eval");
+    let m = l.mesh([linspace(0.0, 2.0, 5), linspace(0.0, 2.0, 3)]);
+    expect(m.shape() == [5, 3] && m[2, 1] == 5.0, "mesh");
+    let bad: Matrix<f64> = [[0, 0, 0]];
+    expect(throws_kind(|| { _ = try l.eval(bad); }, "LengthMismatch"), "point rank");
+    expect(throws_kind(|| { _ = try pkg::bilinear(x, Vector::<f64>::from([0.0, 1.0]), z); }, "LengthMismatch"), "axis length");
+    expect(throws_kind(|| { _ = try pkg::bilinear(Vector::<f64>::from([0.0, 2.0, 1.0]), x, z); }, "NotSorted"), "axis order");
+}
+
+#[test]
+fn tensor_cubic_exact() {
+    let x = sorted(8, 0.0, 3.0, 11);
+    let y = sorted(6, -1.0, 1.0, 12);
+    let f = |a: f64, b: f64| -> f64 { a ** 3 * b - 2.0 * a * b ** 2 + b ** 3 - 1.0 };
+    let z = Matrix::<f64>::from_fn([8, 6], |i: [usize; 2]| -> f64 { f(x[i[0]], y[i[1]]) });
+    let s = try! pkg::bicubic(x, y, z);
+    let g = try! pkg::grid([x, y], z, GridMethod::Cubic);
+    let px = uniform(60, 0.0, 3.0, 13);
+    let py = uniform(60, -1.0, 1.0, 14);
+    for i in 0..60 {
+        let p: [f64; 2] = [px[i].max(x[0]).min(x[7]), py[i].max(y[0]).min(y[5])];
+        rel(s.at(p), f(p[0], p[1]), 1e-10, "bicubic");
+        rel(g.at(p), s.at(p), 1e-14, "grid cubic = bicubic");
+    }
+    // Partials and the integral of a x^2 y on the unit cell grid.
+    let u = linspace(0.0, 3.0, 7);
+    let h = Matrix::<f64>::from_fn([7, 7], |i: [usize; 2]| -> f64 { u[i[0]] * u[i[0]] * u[i[1]] });
+    let t = try! pkg::bicubic(u, u, h);
+    close(t.partial(0, 1).at([1.0, 2.0]), 4.0, 1e-11, "d/dx");
+    close(t.partial(1, 1).at([1.5, 2.0]), 2.25, 1e-11, "d/dy");
+    close(t.partial(0, 2).at([1.5, 2.0]), 4.0, 1e-10, "d2/dx2");
+    close(t.integrate([0.0..3.0, 0.0..2.0]), 9.0 * 2.0, 1e-10, "integral");
+    close(t.integrate([1.0..2.0, 0.5..1.5]), 7.0 / 3.0 * 1.0, 1e-11, "inner box");
+    // Rank 3 with a short axis (degree drops to 1 there).
+    let a = linspace(0.0, 1.0, 5);
+    let b: Vector<f64> = [0, 1];
+    let v = Array::from_fn([5, 2, 5], |i: [usize; 3]| -> f64 { a[i[0]] ** 2 * (1.0 + b[i[1]]) + a[i[2]] ** 3 });
+    let s3 = try! TensorSpline::fit([a, b, a], v, 3);
+    expect(s3.degrees() == [3, 1, 3], "degrees");
+    close(s3.at([0.3, 0.5, 0.7]), 0.09 * 1.5 + 0.343, 1e-12, "rank 3");
+    let tiny: Vector<f64> = [0];
+    expect(throws_kind(|| { _ = try TensorSpline::fit([tiny], Vector::<f64>::from([1.0])); }, "TooFewPoints"), "one point");
+}

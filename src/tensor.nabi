@@ -1,0 +1,362 @@
+// Tensor-product B-splines of any rank: `s(x) = sum_I c[I] prod_d
+// B[i_d](x_d)`. Interpolation on a grid solves one banded collocation
+// system per axis (de Boor, "A Practical Guide to Splines", ch. XVII),
+// O(n_total k) after factoring each axis once.
+
+use pkg::bspline::basis::{basis, span};
+use pkg::bspline::fit::{collocation, interp_knots};
+use pkg::curve::{fill, wrap};
+use pkg::data::{arg, enough, finite, list, rising, same, vector};
+use pkg::{Extrapolate, InterpError};
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+use linalg::AsVector;
+
+/// A tensor-product spline of rank `N`: knots and a degree per axis and
+/// a coefficient array; call it at a point, `s([x, y])`. Evaluation is
+/// O(N log n + prod (k_d + 1)).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [0, 1, 2, 3, 4];
+/// let z = Matrix::<f64>::from_fn([5, 5], |i: [usize; 2]| -> f64 { (i[0] * i[1] * i[1]) as f64 });
+/// let s = try interpolate::bicubic(x, x, z);
+/// assert((s([2.5, 1.5]) - 5.625).abs() < 1e-12);             // x y^2
+/// ```
+#[derive(Clone)]
+pub struct TensorSpline<const N: usize> {
+    pub(pkg) t: List<List<f64>>;
+    pub(pkg) k: [usize; N];
+    pub(pkg) n: [usize; N];
+    pub(pkg) c: List<f64>;
+    pub(pkg) mode: Extrapolate;
+}
+
+/// The tensor-product cubic spline interpolating `z` (shape
+/// `[x.len(), y.len()]`) on the grid `x` by `y`, not-a-knot along both
+/// axes (scipy's `RectBivariateSpline` with `s = 0`).
+///
+/// ```nabi
+/// use core::array::{Matrix, Vector};
+///
+/// let x: Vector<f64> = [0, 1, 2, 3];
+/// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] + i[1]) as f64 });
+/// assert(((try interpolate::bicubic(x, x, z)).at([0.5, 0.25]) - 0.75).abs() < 1e-14);
+/// ```
+pub fn bicubic<X: AsVector<f64>, Y: AsVector<f64>>(x: X, y: Y, z: Matrix<f64>) throws (InterpError) -> TensorSpline<2> {
+    let x: Vector<f64> = x.as_vector();
+    let y: Vector<f64> = y.as_vector();
+    try TensorSpline::fit([x, y], z, 3)
+}
+
+impl<const N: usize> TensorSpline<N> {
+    /// The interpolating spline of degree `k` (lower along an axis with
+    /// fewer than k + 1 points) through `values` on the grid `axes`.
+    ///
+    /// ```nabi
+    /// use interpolate::TensorSpline;
+    /// use core::array::{Array, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let v = Array::from_fn([4, 4, 4], |i: [usize; 3]| -> f64 { (i[0] * i[1] * i[2]) as f64 });
+    /// let s = try TensorSpline::fit([x, x, x], v, 3);
+    /// assert((s.at([0.5, 1.5, 2.5]) - 1.875).abs() < 1e-12);
+    /// ```
+    pub fn fit(axes: [Vector<f64>; N], values: Array<f64, N>, k: usize = 3) throws (InterpError) -> TensorSpline<N> {
+        try arg(k >= 1, "a tensor spline needs degree 1 or more");
+        let shape = values.shape();
+        let c = values.to_list();
+        try finite(c, "values");
+        let ts: List<List<f64>> = [];
+        let ks = [0usize; N];
+        let stride = [1usize; N];
+        let s = 1usize;
+        let d = N;
+        while d > 0 {
+            d -= 1;
+            stride[d] = s;
+            s *= shape[d];
+        }
+        for d in 0..N {
+            let a = list(axes[d]).clone();
+            try same(shape[d], a.len(), f"values axis {d}", f"axes[{d}]");
+            try enough(a.len(), 2);
+            try finite(a, f"axes[{d}]");
+            try rising(a);
+            let kd = k.min(a.len() - 1);
+            ks[d] = kd;
+            let t: List<f64> = [];
+            if kd == 1 {
+                t.push(a[0]);
+                for v in a { t.push(v); }
+                t.push(a[a.len() - 1]);
+                ts.push(t);
+                continue;
+            }
+            t = interp_knots(a, kd);
+            let m = try collocation(a, t, kd);
+            // Every line along axis d: offsets whose index d is 0.
+            let total = c.len();
+            let block = stride[d] * shape[d];
+            let o = 0usize;
+            while o < total {
+                for r in 0..stride[d] { m.solve(c, o + r, stride[d]); }
+                o += block;
+            }
+            ts.push(t);
+        }
+        TensorSpline { t: ts, k: ks, n: shape, c, mode: Extrapolate::Extend }
+    }
+
+    /// This spline with extrapolation `mode`, applied per axis.
+    ///
+    /// ```nabi
+    /// use interpolate::Extrapolate;
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { i[0] as f64 });
+    /// let s = (try interpolate::bicubic(x, x, z)).extrapolate(Extrapolate::Clamp);
+    /// assert((s.at([5.0, 1.0]) - 3.0).abs() < 1e-14);
+    /// ```
+    pub fn extrapolate(self, mode: Extrapolate) -> TensorSpline<N> { TensorSpline { t: self.t, k: self.k, n: self.n, c: self.c, mode } }
+
+    /// The degree along each axis.
+    pub fn degrees(self) -> [usize; N] { self.k }
+
+    /// The knots of axis `d`.
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let s = try interpolate::bicubic(x, x, Matrix::<f64>::zeros([4, 4]));
+    /// assert(s.knots(1).len() == 8);
+    /// ```
+    pub fn knots(self, d: usize) -> Vector<f64> { vector(self.t[d].clone()) }
+
+    /// The coefficients, an array with one axis per dimension.
+    pub fn coefficients(self) -> Array<f64, N> { Array::from_list(self.c.clone(), self.n) }
+
+    /// The value at `p`.
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2];
+    /// let z: Matrix<f64> = [[0, 1, 4], [1, 2, 5], [4, 5, 8]];   // x^2 + y^2
+    /// let s = try interpolate::bicubic(x, x, z);
+    /// assert((s.at([0.5, 1.5]) - 2.5).abs() < 1e-13);
+    /// ```
+    pub fn at(self, p: [f64; N]) -> f64 { self.at_with(p, self.scratch()) }
+
+    /// Work space for `at_with`: the basis values of every axis, packed,
+    /// and the recurrence's rows.
+    fn scratch(self) -> Scratch {
+        let total = 0usize;
+        let big = 0usize;
+        for d in 0..N {
+            total += self.k[d] + 1;
+            big = big.max(self.k[d] + 1);
+        }
+        Scratch { b: List::filled(total, 0.0), one: List::filled(big, 0.0), left: List::filled(big, 0.0), right: List::filled(big, 0.0) }
+    }
+
+    fn at_with(self, p: [f64; N], w: Scratch) -> f64 {
+        let lsp = [0usize; N];
+        let o = [0usize; N];
+        let total = 0usize;
+        for d in 0..N {
+            o[d] = total;
+            total += self.k[d] + 1;
+        }
+        let b = w.b;
+        for d in 0..N {
+            let t = self.t[d];
+            let k = self.k[d];
+            let (lo, hi) = (t[k], t[self.n[d]]);
+            let x = wrap(self.mode, p[d], lo, hi) ?? return fill(self.mode);
+            if x.is_nan() { return f64::NAN; }
+            let l = span(t, k, self.n[d], x);
+            lsp[d] = l;
+            basis(t, k, l, x, w.one, w.left, w.right);
+            for r in 0..=k { b[o[d] + r] = w.one[r]; }
+        }
+        // sum c[I] prod_d b[d][j_d] over the nonzero block, the last axis
+        // fastest.
+        let count = 1usize;
+        for d in 0..N { count *= self.k[d] + 1; }
+        let sum = 0.0;
+        for m in 0..count {
+            let r = m;
+            let f = 1.0;
+            let off = 0usize;
+            let d = N;
+            let stride = 1usize;
+            while d > 0 {
+                d -= 1;
+                let kd = self.k[d] + 1;
+                let j = r % kd;
+                r /= kd;
+                f *= b[o[d] + j];
+                off += (lsp[d] - self.k[d] + j) * stride;
+                stride *= self.n[d];
+            }
+            sum += f * self.c[off];
+        }
+        sum
+    }
+
+    /// The values at the points in the rows of `points` (m x N).
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] * i[1]) as f64 });
+    /// let s = try interpolate::bicubic(x, x, z);
+    /// let p: Matrix<f64> = [[0.5, 2], [3, 3]];
+    /// let v = try s.eval(p);
+    /// assert((v[0] - 1.0).abs() < 1e-13 && (v[1] - 9.0).abs() < 1e-12);
+    /// ```
+    pub fn eval(self, points: Matrix<f64>) throws (InterpError) -> Vector<f64> {
+        let s = points.shape();
+        try same(s[1], N, "each point", "spline axes");
+        let ps = list(points);
+        let out = List::filled(s[0], 0.0);
+        let p = [0.0; N];
+        let w = self.scratch();
+        for i in 0..s[0] {
+            for d in 0..N { p[d] = ps[i * N + d]; }
+            out[i] = self.at_with(p, w);
+        }
+        vector(out)
+    }
+
+    /// The partial derivative of order `nu` along `axis`, a tensor spline
+    /// of degree `k - nu` there.
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] * i[0] * i[1]) as f64 });
+    /// let s = try interpolate::bicubic(x, x, z);
+    /// assert((s.partial(0, 1).at([1.5, 2.0]) - 6.0).abs() < 1e-12);  // d/dx x^2 y = 2 x y
+    /// ```
+    pub fn partial(self, axis: usize, nu: usize = 1) -> TensorSpline<N> {
+        let s = self;
+        for _ in 0..nu {
+            let k = s.k[axis];
+            if k == 0 {
+                return TensorSpline { t: s.t, k: s.k, n: s.n, c: List::filled(s.c.len(), 0.0), mode: s.mode };
+            }
+            let t = s.t[axis];
+            let n = s.n[axis];
+            let stride = 1usize;
+            for d in (axis + 1)..N { stride *= s.n[d]; }
+            let outer = s.c.len() / (stride * n);
+            let nn = s.n;
+            nn[axis] = n - 1;
+            let c = List::filled(outer * (n - 1) * stride, 0.0);
+            for o in 0..outer {
+                for i in 0..n - 1 {
+                    let den = t[i + k + 1] - t[i + 1];
+                    let f = if den > 0.0 { (k as f64) / den } else { 0.0 };
+                    for r in 0..stride {
+                        let a = s.c[(o * n + i + 1) * stride + r];
+                        let b = s.c[(o * n + i) * stride + r];
+                        c[(o * (n - 1) + i) * stride + r] = f * (a - b);
+                    }
+                }
+            }
+            let ts = s.t.clone();
+            ts[axis] = t[1:t.len() - 1].to_list();
+            let ks = s.k;
+            ks[axis] = k - 1;
+            s = TensorSpline { t: ts, k: ks, n: nn, c, mode: s.mode };
+        }
+        s
+    }
+
+    /// The integral over the box `r[0] x r[1] x ...`, each range in or
+    /// beyond the base interval (the end pieces continue).
+    ///
+    /// ```nabi
+    /// use core::array::{Matrix, Vector};
+    ///
+    /// let x: Vector<f64> = [0, 1, 2, 3];
+    /// let z = Matrix::<f64>::from_fn([4, 4], |i: [usize; 2]| -> f64 { (i[0] * i[1]) as f64 });
+    /// let s = try interpolate::bicubic(x, x, z);
+    /// assert((s.integrate([0.0..2.0, 0.0..3.0]) - 9.0).abs() < 1e-12);
+    /// ```
+    pub fn integrate(self, r: [Range<f64>; N]) -> f64 {
+        let ws: List<List<f64>> = [];
+        for d in 0..N { ws.push(basis_integrals(self.t[d], self.k[d], self.n[d], r[d].start, r[d].end)); }
+        // Contract axis by axis, last first.
+        let c = self.c;
+        let len = c.len();
+        let d = N;
+        while d > 0 {
+            d -= 1;
+            let n = self.n[d];
+            let rows = len / n;
+            let next = List::filled(rows, 0.0);
+            for i in 0..rows {
+                let s = 0.0;
+                for j in 0..n { s += c[i * n + j] * ws[d][j]; }
+                next[i] = s;
+            }
+            c = next;
+            len = rows;
+        }
+        c[0]
+    }
+}
+
+impl<const N: usize> ops::Call<[f64; N]> for TensorSpline<N> {
+    type Output = f64;
+    fn call(self, p: [f64; N]) -> f64 { self.at(p) }
+}
+
+/// The work space of `TensorSpline::at_with`.
+struct Scratch {
+    b: List<f64>;
+    one: List<f64>;
+    left: List<f64>;
+    right: List<f64>;
+}
+
+/// `int_a^b B_i` for every basis function of knots `t`, degree `k`, `n`
+/// coefficients: from the antiderivative in the basis of degree k + 1
+/// (de Boor's formula), with the end pieces continued.
+pub(pkg) fn basis_integrals(t: List<f64>, k: usize, n: usize, a: f64, b: f64) -> List<f64> {
+    // Knots of degree k + 1: t with each end repeated once more.
+    let te: List<f64> = [t[0]];
+    for v in t { te.push(v); }
+    te.push(t[t.len() - 1]);
+    let at = |x: f64| -> List<f64> {
+        // Suffix sums: int B_i up to x = w_i sum_{j > i} B_{j, k + 1}(x).
+        let k2 = k + 1;
+        let n2 = n + 1;
+        let l = span(te, k2, n2, x);
+        let bv = List::filled(k2 + 1, 0.0);
+        basis(te, k2, l, x, bv, List::filled(k2 + 1, 0.0), List::filled(k2 + 1, 0.0));
+        let full = List::filled(n2, 0.0);
+        for r in 0..=k2 { full[l - k2 + r] = bv[r]; }
+        let out = List::filled(n, 0.0);
+        let acc = 0.0;
+        let i = n2;
+        while i > 1 {
+            i -= 1;
+            acc += full[i];
+            out[i - 1] = acc * (t[i - 1 + k + 1] - t[i - 1]) / ((k + 1) as f64);
+        }
+        out
+    };
+    let (fa, fb) = (at(a), at(b));
+    let out = List::filled(n, 0.0);
+    for i in 0..n { out[i] = fb[i] - fa[i]; }
+    out
+}

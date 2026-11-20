@@ -1,0 +1,422 @@
+//! Chebyshev series `sum_k c_k T_k(u)` on a domain `[a, b]`, `u` the
+//! affine map of `x` onto `[-1, 1]`. The basis of choice for
+//! approximating smooth functions: interpolation at Chebyshev points
+//! converges geometrically for analytic functions and never suffers
+//! Runge's phenomenon.
+
+use pkg::data::{arg, enough, finite, list, same, vector};
+use pkg::{Curve, InterpError, Polynomial};
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+
+/// A Chebyshev series on `[a, b]`. It is a `Curve` (Clenshaw's
+/// recurrence, O(n), backward stable) and takes `+ - *` with another
+/// series on the same domain or an `f64`.
+///
+/// ```nabi
+/// use interpolate::{Chebyshev, Curve};
+///
+/// let c = Chebyshev::interpolate(f64::exp, 20, 0.0..1.0);
+/// assert((c.at(0.3) - 0.3f64.exp()).abs() < 1e-14);
+/// assert((c.integrate() - (1f64.exp() - 1.0)).abs() < 1e-14);
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub struct Chebyshev {
+    c: List<f64>;
+    a: f64;
+    b: f64;
+}
+
+fn trim(c: List<f64>, a: f64, b: f64) -> Chebyshev {
+    let n = c.len();
+    while n > 1 && c[n - 1] == 0.0 { n -= 1; }
+    let out = List::with_capacity(n.max(1));
+    for i in 0..n { out.push(c[i]); }
+    if out.len() == 0 { out.push(0.0); }
+    Chebyshev { c: out, a, b }
+}
+
+impl Chebyshev {
+    /// The series with coefficients `coef` (of `T_0`, `T_1`, ...) on
+    /// `domain`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Curve};
+    ///
+    /// let t2 = try Chebyshev::new([0, 0, 1], -1.0..1.0);      // 2x^2 - 1
+    /// assert(t2.at(0.5) == -0.5);
+    /// ```
+    pub fn new(coef: Vector<f64>, domain: Range<f64>) throws (InterpError) -> Chebyshev {
+        try check(domain);
+        trim(list(coef).clone(), domain.start, domain.end)
+    }
+
+    /// The interpolant of `f` at the `n` Chebyshev points of the first
+    /// kind on `domain`, `x_j = cos(pi (j + 1/2) / n)` mapped, by the
+    /// discrete cosine sum (O(n^2)). For analytic `f` the error falls
+    /// geometrically with `n`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Curve};
+    ///
+    /// let runge = |x: f64| -> f64 { 1.0 / (1.0 + 25.0 * x * x) };
+    /// let c = Chebyshev::interpolate(runge, 200, -1.0..1.0);
+    /// assert((c.at(0.7) - runge(0.7)).abs() < 1e-14);
+    /// ```
+    pub fn interpolate(f: fn(f64) -> f64, n: usize, domain: Range<f64>) -> Chebyshev {
+        let (a, b) = (domain.start, domain.end);
+        let n = n.max(1);
+        let fx = List::filled(n, 0.0);
+        for j in 0..n {
+            let u = (f64::PI * ((j as f64) + 0.5) / (n as f64)).cos();
+            fx[j] = f(0.5 * (b - a) * u + 0.5 * (a + b));
+        }
+        let c = List::filled(n, 0.0);
+        for k in 0..n {
+            let s = 0.0;
+            for j in 0..n { s += fx[j] * (f64::PI * (k as f64) * ((j as f64) + 0.5) / (n as f64)).cos(); }
+            c[k] = 2.0 * s / (n as f64);
+        }
+        c[0] *= 0.5;
+        trim(c, a, b)
+    }
+
+    /// The least-squares series of degree `deg` through `(x, y)` on the
+    /// domain `[min x, max x]`, by pivoted QR (`linalg::lstsq`) on the
+    /// Chebyshev-Vandermonde matrix, which stays well conditioned at high
+    /// degree.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Curve};
+    ///
+    /// let c = try Chebyshev::fit([0, 1, 2, 3, 4], [0, 1, 4, 9, 16], 2);
+    /// assert((c.at(2.5) - 6.25).abs() < 1e-13);
+    /// ```
+    pub fn fit(x: Vector<f64>, y: Vector<f64>, deg: usize) throws (InterpError) -> Chebyshev {
+        let xs = list(x);
+        let ys = list(y);
+        try same(xs.len(), ys.len(), "x", "y");
+        try enough(xs.len(), deg + 1);
+        try finite(xs, "x");
+        try finite(ys, "y");
+        let (a, b) = (xs.min() ?? 0.0, xs.max() ?? 0.0);
+        try arg(b > a, "fit needs at least two distinct x values (the domain is [min x, max x])");
+        let m = xs.len();
+        let v: Matrix<f64> = Array::zeros([m, deg + 1]);
+        for i in 0..m {
+            let u = (2.0 * xs[i] - a - b) / (b - a);
+            let (t0, t1): (f64, f64) = (1.0, u); // typed, as in Polynomial::fit
+            for j in 0..deg + 1 {
+                v[i, j] = t0;
+                let t2 = 2.0 * u * t1 - t0;
+                t0 = t1;
+                t1 = t2;
+            }
+        }
+        let q = try linalg::lstsq(v, vector(ys.clone())) catch e: linalg::LinalgError {
+            throw InterpError::Singular { what: f"Chebyshev fit of degree {deg}: {e}" };
+        };
+        trim(list(q), a, b)
+    }
+
+    /// The coefficients of `T_0`, `T_1`, ...
+    ///
+    /// ```nabi
+    /// use interpolate::Chebyshev;
+    ///
+    /// let c = try Chebyshev::new([1, 2], 0.0..1.0);
+    /// assert(c.coefficients()[1] == 2.0);
+    /// ```
+    pub fn coefficients(self) -> Vector<f64> { vector(self.c.clone()) }
+
+    /// The domain `(a, b)`.
+    ///
+    /// ```nabi
+    /// use interpolate::Chebyshev;
+    ///
+    /// assert((try Chebyshev::new([1], 2.0..5.0)).domain() == (2.0, 5.0));
+    /// ```
+    pub fn domain(self) -> (f64, f64) { (self.a, self.b) }
+
+    /// The degree.
+    ///
+    /// ```nabi
+    /// use interpolate::Chebyshev;
+    ///
+    /// assert((try Chebyshev::new([1, 0, 3], -1.0..1.0)).degree() == 2);
+    /// ```
+    pub fn degree(self) -> usize { self.c.len() - 1 }
+
+    /// The `m`-th derivative (in `x`, so scaled by `2 / (b - a)` per
+    /// order), by the backward recurrence `c'_{k-1} = c'_{k+1} + 2k c_k`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Curve};
+    ///
+    /// let c = Chebyshev::interpolate(f64::sin, 25, 0.0..2.0);
+    /// assert((c.deriv(1).at(1.0) - 1f64.cos()).abs() < 1e-13);
+    /// ```
+    pub fn deriv(self, m: usize = 1) -> Chebyshev {
+        let c = self.c;
+        let s = 2.0 / (self.b - self.a);
+        for _ in 0..m {
+            let n = c.len();
+            if n <= 1 { return trim([0.0], self.a, self.b); }
+            let d = List::filled(n - 1, 0.0);
+            let k = n - 1;
+            while k >= 1 {
+                let up = if k + 1 <= n - 2 { d[k + 1] } else { 0.0 };
+                d[k - 1] = up + 2.0 * (k as f64) * c[k];
+                k -= 1;
+            }
+            d[0] *= 0.5;
+            for i in 0..d.len() { d[i] *= s; }
+            c = d;
+        }
+        trim(c, self.a, self.b)
+    }
+
+    /// The `m`-th antiderivative, each one zero at `a`.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Curve};
+    ///
+    /// let c = Chebyshev::interpolate(f64::cos, 25, 0.0..2.0);
+    /// assert((c.integ(1).at(1.5) - 1.5f64.sin()).abs() < 1e-14);
+    /// ```
+    pub fn integ(self, m: usize = 1) -> Chebyshev {
+        let r = self;
+        let h = 0.5 * (self.b - self.a);
+        for _ in 0..m {
+            let c = r.c;
+            let n = c.len();
+            let d = List::filled(n + 1, 0.0);
+            for k in 1..=n {
+                let lo = c[k - 1] * (if k == 1 { 2.0 } else { 1.0 });
+                let hi = if k + 1 < n { c[k + 1] } else { 0.0 };
+                d[k] = h * (lo - hi) / (2.0 * (k as f64));
+            }
+            let q = trim(d, r.a, r.b);
+            // Zero at u = -1: T_k(-1) = (-1)^k.
+            let v = 0.0;
+            for k in 0..q.c.len() { v += if k % 2 == 0 { q.c[k] } else { -q.c[k] }; }
+            q.c[0] -= v;
+            r = q;
+        }
+        r
+    }
+
+    /// The integral over the domain.
+    ///
+    /// ```nabi
+    /// use interpolate::Chebyshev;
+    ///
+    /// let c = try Chebyshev::new([1], 0.0..3.0);
+    /// assert(c.integrate() == 3.0);
+    /// ```
+    pub fn integrate(self) -> f64 {
+        // Integral of T_k over [-1, 1]: 2 / (1 - k^2) for even k, 0 for odd.
+        let s = 0.0;
+        for k in 0..self.c.len() {
+            if k % 2 == 0 { s += self.c[k] * 2.0 / (1.0 - ((k * k) as f64)); }
+        }
+        s * 0.5 * (self.b - self.a)
+    }
+
+    /// The real roots in the domain, rising, after dropping trailing
+    /// coefficients at rounding level: eigenvalues of the
+    /// colleague matrix (`linalg::eig`) with imaginary part below 1e-6
+    /// and real part in `[-1, 1]` (within 1e-6, so roots on the domain's
+    /// ends stay), mapped to `x` and
+    /// polished by Newton steps.
+    ///
+    /// ```nabi
+    /// use interpolate::Chebyshev;
+    ///
+    /// let c = Chebyshev::interpolate(f64::sin, 30, 1.0..10.0);
+    /// let r = try c.roots();
+    /// assert(r.len() == 3 && (r[0] - f64::PI).abs() < 1e-13);
+    /// ```
+    pub fn roots(self) throws (InterpError) -> Vector<f64> {
+        // Rounding noise in the tail would put spurious eigenvalues
+        // anywhere: drop trailing terms below 32 eps of the largest.
+        let big = 0.0;
+        for v in self.c { big = big.max(v.abs()); }
+        let keep = self.c.len();
+        while keep > 1 && self.c[keep - 1].abs() <= 32.0 * f64::EPSILON * big { keep -= 1; }
+        let cut = List::with_capacity(keep);
+        for k in 0..keep { cut.push(self.c[k]); }
+        let t = trim(cut, self.a, self.b);
+        let n = t.c.len() - 1;
+        let out: List<f64> = [];
+        let map = |u: f64| -> f64 { 0.5 * (t.b - t.a) * u + 0.5 * (t.a + t.b) };
+        if n == 0 { return vector(out); }
+        if n == 1 {
+            let u = -t.c[0] / t.c[1];
+            if u.abs() <= 1.0 + 1e-8 { out.push(map(u.max(-1.0).min(1.0))); }
+            return vector(out);
+        }
+        // Colleague matrix: x T_k = (T_{k-1} + T_{k+1}) / 2, x T_0 = T_1.
+        let m: Matrix<f64> = Array::zeros([n, n]);
+        m[0, 1] = 1.0;
+        for i in 1..n {
+            m[i, i - 1] = 0.5;
+            if i + 1 < n { m[i, i + 1] = 0.5; }
+        }
+        for j in 0..n { m[n - 1, j] -= t.c[j] / (2.0 * t.c[n]); }
+        let e = try linalg::eig(pkg::poly::polynomial::balance(m)) catch _: linalg::LinalgError {
+            throw InterpError::NoConvergence { iterations: 30 * n, value: f64::NAN, error: f64::NAN };
+        };
+        let d = t.deriv(1);
+        let span = t.b - t.a;
+        for z in e.values() {
+            if z.im.abs() > 1e-6 || z.re.abs() > 1.0 + 1e-6 { continue; }
+            let x = map(z.re);
+            for _ in 0..4 {
+                let (f, df) = (t.at(x), d.at(x));
+                if df == 0.0 { break; }
+                let nx = x - f / df;
+                if t.at(nx).abs() <= f.abs() { x = nx; } else { break; }
+            }
+            // An end root may sit a hair outside after rounding.
+            let tol = 1e-12 * span;
+            if x < t.a - tol || x > t.b + tol { continue; }
+            out.push(x.max(t.a).min(t.b));
+        }
+        out.sort_by(|a: f64, b: f64| a.total_cmp(b));
+        // A double root can show as two close eigenvalues.
+        let uniq: List<f64> = [];
+        for x in out {
+            if uniq.len() == 0 || x - uniq[uniq.len() - 1] > 1e-12 * span { uniq.push(x); }
+        }
+        vector(uniq)
+    }
+
+    /// The same function as a power series in `x`. Converting loses
+    /// digits for high degrees (the power basis is ill conditioned);
+    /// keep the series for evaluation.
+    ///
+    /// ```nabi
+    /// use interpolate::{Chebyshev, Polynomial};
+    ///
+    /// let t2 = try Chebyshev::new([0, 0, 1], -1.0..1.0);
+    /// assert(t2.to_polynomial() == Polynomial::new([-1, 0, 2]));
+    /// ```
+    pub fn to_polynomial(self) -> Polynomial {
+        let s = 2.0 / (self.b - self.a);
+        let u = Polynomial::of([-(self.a + self.b) / (self.b - self.a), s]);
+        // Clenshaw with polynomial arithmetic.
+        let (b1, b2) = (Polynomial::constant(0.0), Polynomial::constant(0.0));
+        let k = self.c.len();
+        while k > 1 {
+            k -= 1;
+            let b0 = 2.0 * u * b1 - b2 + self.c[k];
+            b2 = b1;
+            b1 = b0;
+        }
+        u * b1 - b2 + self.c[0]
+    }
+}
+
+fn check(d: Range<f64>) throws (InterpError) {
+    try arg(d.start.is_finite() && d.end.is_finite() && d.end > d.start, f"the domain {d.start}..{d.end} must be finite and rising");
+}
+
+impl Curve for Chebyshev {
+    fn at(self, x: f64) -> f64 {
+        let u = (2.0 * x - self.a - self.b) / (self.b - self.a);
+        let (b1, b2) = (0.0, 0.0);
+        let k = self.c.len();
+        while k > 1 {
+            k -= 1;
+            let b0 = 2.0 * u * b1 - b2 + self.c[k];
+            b2 = b1;
+            b1 = b0;
+        }
+        u * b1 - b2 + self.c[0]
+    }
+}
+
+#[track_caller]
+fn same_domain(p: Chebyshev, q: Chebyshev) {
+    if p.a != q.a || p.b != q.b {
+        panic(f"Chebyshev series on different domains [{p.a}, {p.b}] and [{q.a}, {q.b}]; rebuild one with `interpolate` on the other's domain");
+    }
+}
+
+fn add(p: Chebyshev, q: List<f64>, sign: f64) -> Chebyshev {
+    let c = List::filled(p.c.len().max(q.len()), 0.0);
+    for i in 0..p.c.len() { c[i] += p.c[i]; }
+    for i in 0..q.len() { c[i] += sign * q[i]; }
+    trim(c, p.a, p.b)
+}
+
+fn scale(p: Chebyshev, s: f64) -> Chebyshev {
+    let c = List::filled(p.c.len(), 0.0);
+    for i in 0..p.c.len() { c[i] = s * p.c[i]; }
+    trim(c, p.a, p.b)
+}
+
+/// Same domain only; others panic, naming both.
+impl ops::Add for Chebyshev {
+    type Output = Chebyshev;
+    #[track_caller]
+    fn add(self, rhs: Chebyshev) -> Chebyshev {
+        same_domain(self, rhs);
+        add(self, rhs.c, 1.0)
+    }
+}
+
+impl ops::Add<f64> for Chebyshev {
+    type Output = Chebyshev;
+    fn add(self, rhs: f64) -> Chebyshev { add(self, [rhs], 1.0) }
+}
+
+/// Same domain only; others panic, naming both.
+impl ops::Sub for Chebyshev {
+    type Output = Chebyshev;
+    #[track_caller]
+    fn sub(self, rhs: Chebyshev) -> Chebyshev {
+        same_domain(self, rhs);
+        add(self, rhs.c, -1.0)
+    }
+}
+
+impl ops::Sub<f64> for Chebyshev {
+    type Output = Chebyshev;
+    fn sub(self, rhs: f64) -> Chebyshev { add(self, [rhs], -1.0) }
+}
+
+/// The product series, `T_m T_n = (T_{m+n} + T_{|m-n|}) / 2`. Same
+/// domain only.
+impl ops::Mul for Chebyshev {
+    type Output = Chebyshev;
+    #[track_caller]
+    fn mul(self, rhs: Chebyshev) -> Chebyshev {
+        same_domain(self, rhs);
+        let c = List::filled(self.c.len() + rhs.c.len() - 1, 0.0);
+        for m in 0..self.c.len() {
+            for n in 0..rhs.c.len() {
+                let v = 0.5 * self.c[m] * rhs.c[n];
+                c[m + n] += v;
+                c[if m > n { m - n } else { n - m }] += v;
+            }
+        }
+        trim(c, self.a, self.b)
+    }
+}
+
+impl ops::Mul<f64> for Chebyshev {
+    type Output = Chebyshev;
+    fn mul(self, rhs: f64) -> Chebyshev { scale(self, rhs) }
+}
+
+impl ops::Mul<Chebyshev> for f64 {
+    type Output = Chebyshev;
+    fn mul(self, rhs: Chebyshev) -> Chebyshev { scale(rhs, self) }
+}
+
+impl ops::Neg for Chebyshev {
+    type Output = Chebyshev;
+    fn neg(self) -> Chebyshev { scale(self, -1.0) }
+}

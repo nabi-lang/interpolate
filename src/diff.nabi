@@ -1,0 +1,320 @@
+//! Numerical differentiation: gradients of samples on 1-d and N-d grids,
+//! finite-difference weights for any stencil (Fornberg 1988), smooth
+//! derivatives of uniform samples to a chosen order of accuracy, and
+//! derivatives of functions by Ridders' extrapolation.
+
+use pkg::InterpError;
+use pkg::data::{arg, list, same, vector};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+/// An estimate and its error, from `derivative`.
+///
+/// ```nabi
+/// let d = try interpolate::derivative(f64::sin, 0.0);
+/// assert((d.value - 1.0).abs() <= d.error.max(1e-14));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Estimate {
+    /// The value.
+    pub value: f64;
+    /// An estimate of its absolute error.
+    pub error: f64;
+}
+
+/// The gradient along one line of samples: `n` values of `y` from
+/// `yo` by `ys`, positions `x` (or step `h`), into `out` from `oo` by
+/// `os`.
+fn line(y: List<f64>, yo: usize, ys: usize, n: usize, x: List<f64>?, h: f64, edge: usize, out: List<f64>, oo: usize, os: usize) {
+    let at = |i: usize| -> f64 { y[yo + i * ys] };
+    let pos = |i: usize| -> f64 {
+        match x {
+            none => h * (i as f64),
+            p: List<f64> => p[i],
+        }
+    };
+    if x is none {
+        // Uniform: one subtraction and one product a sample.
+        let r = 0.5 / h;
+        let (a, b) = (yo + 2 * ys, oo + os);
+        for i in 0..n - 2 { out[b + i * os] = (y[a + i * ys] - y[yo + i * ys]) * r; }
+    } else {
+        line_uneven(y, yo, ys, n, pos, out, oo, os);
+    }
+    if edge == 1 || n == 2 {
+        out[oo] = (at(1) - at(0)) / (pos(1) - pos(0));
+        out[oo + (n - 1) * os] = (at(n - 1) - at(n - 2)) / (pos(n - 1) - pos(n - 2));
+        return;
+    }
+    let (d1, d2) = (pos(1) - pos(0), pos(2) - pos(1));
+    let a = -(2.0 * d1 + d2) / (d1 * (d1 + d2));
+    let b = (d1 + d2) / (d1 * d2);
+    let c = -d1 / (d2 * (d1 + d2));
+    out[oo] = a * at(0) + b * at(1) + c * at(2);
+    let (e1, e2) = (pos(n - 2) - pos(n - 3), pos(n - 1) - pos(n - 2));
+    let a = e2 / (e1 * (e1 + e2));
+    let b = -(e2 + e1) / (e1 * e2);
+    let c = (2.0 * e2 + e1) / (e2 * (e1 + e2));
+    out[oo + (n - 1) * os] = a * at(n - 3) + b * at(n - 2) + c * at(n - 1);
+}
+
+/// The interior of `line` for uneven positions `pos`.
+fn line_uneven(y: List<f64>, yo: usize, ys: usize, n: usize, pos: fn(usize) -> f64, out: List<f64>, oo: usize, os: usize) {
+    for i in 1..n - 1 {
+        let (hd, hs) = (pos(i) - pos(i - 1), pos(i + 1) - pos(i));
+        let (a, b, c) = (y[yo + (i - 1) * ys], y[yo + i * ys], y[yo + (i + 1) * ys]);
+        out[oo + i * os] = (hd * hd * c - hs * hs * a + (hs * hs - hd * hd) * b) / (hs * hd * (hd + hs));
+    }
+}
+
+/// The derivative of samples `y` at positions `x` (a vector of the same
+/// length) or with a uniform step `dx` (default 1), as NumPy's
+/// `gradient`: second-order central differences inside (the
+/// three-point formula for uneven steps), one-sided differences of
+/// order `edge_order` (1 or 2) at the ends. Exact for quadratics inside,
+/// and at the ends with `edge_order` 2. Needs `edge_order + 1` samples.
+/// O(n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [0, 1, 4, 9];               // x^2
+/// let g = try interpolate::gradient(y, edge_order: 2);
+/// assert(g[0] == 0.0 && g[1] == 2.0 && g[3] == 6.0);
+/// ```
+pub fn gradient(y: Vector<f64>, x: Vector<f64> | f64 = 1.0, edge_order: usize = 1) throws (InterpError) -> Vector<f64> {
+    let ys = list(y);
+    let n = ys.len();
+    try arg(edge_order == 1 || edge_order == 2, f"edge_order is {edge_order}; use 1 or 2");
+    if n < edge_order + 1 { throw InterpError::TooFewPoints { need: edge_order + 1, got: n }; }
+    let (xs, h): (List<f64>?, f64) = match x {
+        d: f64 => {
+            try arg(d.is_finite() && d != 0.0, f"the step dx is {d}; pass a finite, nonzero spacing");
+            (none, d)
+        },
+        v: Vector<f64> => {
+            let p = list(v);
+            try same(n, p.len(), "y", "x");
+            (p, 1.0)
+        },
+    };
+    let out = List::filled(n, 0.0);
+    line(ys, 0, 1, n, xs, h, edge_order, out, 0, 1);
+    vector(out)
+}
+
+/// The gradient of an array of any rank: one array per axis, each the
+/// derivative along that axis as `gradient` computes it. `spacing` is
+/// the step of every axis (one value), of each axis (one per axis), or
+/// 1 when `none`. Every axis needs `edge_order + 1` samples. O(N n).
+///
+/// ```nabi
+/// use core::array::Matrix;
+///
+/// let a: Matrix<f64> = [[0, 1, 2], [10, 11, 12]];   // 10 i + j
+/// let g = try interpolate::gradient_nd(a);
+/// assert(g[0][0, 1] == 10.0 && g[1][1, 2] == 1.0);
+/// let h = try interpolate::gradient_nd(a, [2.0, 0.5]);
+/// assert(h[0][1, 0] == 5.0 && h[1][0, 0] == 2.0);
+/// ```
+pub fn gradient_nd<const N: usize>(a: Array<f64, N>, spacing: List<f64>? = none, edge_order: usize = 1) throws (InterpError) -> List<Array<f64, N>> {
+    try arg(edge_order == 1 || edge_order == 2, f"edge_order is {edge_order}; use 1 or 2");
+    let steps = List::filled(N, 1.0);
+    if let sp = spacing {
+        if sp.len() == 1 {
+            for k in 0..N { steps[k] = sp[0]; }
+        } else {
+            try arg(sp.len() == N, f"spacing has {sp.len()} values for {N} axes; give one, or one per axis");
+            for k in 0..N { steps[k] = sp[k]; }
+        }
+    }
+    for k in 0..N { try arg(steps[k].is_finite() && steps[k] != 0.0, f"the step of axis {k} is {steps[k]}; pass a finite, nonzero spacing"); }
+    let s = a.shape();
+    for k in 0..N {
+        if s[k] < edge_order + 1 {
+            throw InterpError::BadArgument { what: f"axis {k} has {s[k]} samples; a gradient needs {edge_order + 1}" };
+        }
+    }
+    let ys = a.to_list();
+    let total = ys.len();
+    let res: List<Array<f64, N>> = [];
+    let st = List::filled(N, 1usize);
+    let k = N;
+    while k > 1 {
+        k -= 1;
+        st[k - 1] = st[k] * s[k];
+    }
+    for ax in 0..N {
+        let out = List::filled(total, 0.0);
+        let (len, stride) = (s[ax], st[ax]);
+        // Lines along `ax` start at o * len * stride + r, r < stride.
+        for o in 0..total / (len * stride) {
+            for r in 0..stride {
+                let q = o * len * stride + r;
+                line(ys, q, stride, len, none, steps[ax], edge_order, out, q, stride);
+            }
+        }
+        res.push(Array::from_list(out, s));
+    }
+    res
+}
+
+/// The weights `w` with `sum_i w[i] f(stencil[i]) ~ f^(m)(x0)`, by
+/// Fornberg's recursion (Math. Comp. 51, 1988): exact for polynomials of
+/// degree below the stencil size, any distinct points, O(n^2 m).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let s: Vector<f64> = [-1, 0, 1];
+/// let w = try interpolate::fd_weights(2, 0.0, s);
+/// assert(w[0] == 1.0 && w[1] == -2.0 && w[2] == 1.0);
+/// ```
+pub fn fd_weights<S: AsVector<f64>>(m: usize, x0: f64, stencil: S) throws (InterpError) -> Vector<f64> {
+    let stencil: Vector<f64> = stencil.as_vector();
+    let x = list(stencil);
+    let n = x.len();
+    if n < m + 1 { throw InterpError::TooFewPoints { need: m + 1, got: n }; }
+    for i in 0..n {
+        try arg(x[i].is_finite(), f"stencil point {i} is {x[i]}; pass finite points");
+        for j in 0..i { try arg(x[i] != x[j], f"stencil points {j} and {i} are both {x[i]}; the points must differ"); }
+    }
+    try arg(x0.is_finite(), f"x0 is {x0}; pass a finite point");
+    weights(m, x0, x)
+}
+
+/// Fornberg's recursion: the weights of derivative `m` at `z`.
+fn weights(m: usize, z: f64, x: List<f64>) -> Vector<f64> {
+    let n = x.len();
+    let w = m + 1;
+    let c = List::filled(n * w, 0.0);
+    let c1 = 1.0;
+    let c4 = x[0] - z;
+    c[0] = 1.0;
+    for i in 1..n {
+        let mn = i.min(m);
+        let c2 = 1.0;
+        let c5 = c4;
+        c4 = x[i] - z;
+        for j in 0..i {
+            let c3 = x[i] - x[j];
+            c2 *= c3;
+            if j == i - 1 {
+                let k = mn;
+                while k >= 1 {
+                    c[i * w + k] = c1 * ((k as f64) * c[(i - 1) * w + k - 1] - c5 * c[(i - 1) * w + k]) / c2;
+                    k -= 1;
+                }
+                c[i * w] = -c1 * c5 * c[(i - 1) * w] / c2;
+            }
+            let k = mn;
+            while k >= 1 {
+                c[j * w + k] = (c4 * c[j * w + k] - (k as f64) * c[j * w + k - 1]) / c3;
+                k -= 1;
+            }
+            c[j * w] = c4 * c[j * w] / c3;
+        }
+        c1 = c2;
+    }
+    let out = List::filled(n, 0.0);
+    for j in 0..n { out[j] = c[j * w + m]; }
+    vector(out)
+}
+
+/// The `deriv`-th derivative of uniform samples `y` with step `dx`,
+/// with error O(dx^accuracy) (`accuracy` even, 2 by default): central
+/// stencils of `2 floor((deriv + 1) / 2) - 1 + accuracy` points inside,
+/// one-sided stencils of `deriv + accuracy` points near the ends, all
+/// from `fd_weights`. Exact for polynomials of degree below the stencil
+/// size. O(n (deriv + accuracy)).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y: Vector<f64> = [0, 1, 8, 27, 64, 125];       // x^3
+/// let d = try interpolate::differentiate(y, deriv: 2);
+/// assert((d[0] - 0.0).abs() < 1e-12 && (d[5] - 30.0).abs() < 1e-12);
+/// ```
+pub fn differentiate<Y: AsVector<f64>>(y: Y, dx: f64 = 1.0, deriv: usize = 1, accuracy: usize = 2) throws (InterpError) -> Vector<f64> {
+    let y: Vector<f64> = y.as_vector();
+    try arg(deriv >= 1, "deriv must be at least 1 (the first derivative)");
+    try arg(accuracy >= 2 && accuracy % 2 == 0, f"accuracy is {accuracy}; use an even order, 2 or more");
+    try arg(dx.is_finite() && dx != 0.0, f"the step dx is {dx}; pass a finite, nonzero spacing");
+    let ys = list(y);
+    let n = ys.len();
+    let central = 2 * ((deriv + 1) / 2) - 1 + accuracy;
+    let side = deriv + accuracy;
+    let need = central.max(side);
+    if n < need { throw InterpError::TooFewPoints { need, got: n }; }
+    let r = (central - 1) / 2;
+    let scale = dx.powi(deriv as i32);
+    let offs = List::filled(central, 0.0);
+    for j in 0..central { offs[j] = (j as f64) - (r as f64); }
+    let wc = weights(deriv, 0.0, offs);
+    let out = List::filled(n, 0.0);
+    for i in r..n - r {
+        let s = 0.0;
+        for j in 0..central { s += wc[j] * ys[i + j - r]; }
+        out[i] = s / scale;
+    }
+    let pts = List::filled(side, 0.0);
+    for j in 0..side { pts[j] = j as f64; }
+    for i in 0..r.min(n) {
+        let w = weights(deriv, i as f64, pts);
+        let (s, t) = (0.0, 0.0);
+        for j in 0..side {
+            s += w[j] * ys[j];
+            t += w[j] * ys[n - 1 - j];
+        }
+        out[i] = s / scale;
+        // Mirrored: the stencil reads backwards, odd derivatives flip.
+        out[n - 1 - i] = if deriv % 2 == 1 { -t } else { t } / scale;
+    }
+    vector(out)
+}
+
+/// The derivative of order `n` (1 or 2) of `f` at `x` by Ridders'
+/// method: central differences on steps falling from `h` (by default
+/// 0.1 max(1, |x|)) by 1.4, extrapolated in a Neville table, stopping
+/// when the error grows. Usually accurate to about 1e-12 relative for
+/// smooth `f`; `error` is the table's estimate.
+///
+/// ```nabi
+/// let d = try interpolate::derivative(f64::exp, 1.0);
+/// assert((d.value - f64::E).abs() < 1e-11 && d.error < 1e-9);
+/// let c = try interpolate::derivative(f64::cos, 0.0, 2);
+/// assert((c.value + 1.0).abs() < 1e-9);
+/// ```
+pub fn derivative(f: fn(f64) -> f64, x: f64, n: usize = 1, h: f64 = 0.0) throws (InterpError) -> Estimate {
+    try arg(n == 1 || n == 2, f"order n is {n}; use 1 or 2 (or `differentiate` on samples)");
+    try arg(x.is_finite(), f"x is {x}; pass a finite point");
+    try arg(h.is_finite() && h >= 0.0, f"the step h is {h}; pass a positive step, or 0 for the default");
+    let hh = if h > 0.0 { h } else { 0.1 * x.abs().max(1.0) };
+    let fx = if n == 2 { f(x) } else { 0.0 };
+    let d = |s: f64| -> f64 {
+        if n == 1 { (f(x + s) - f(x - s)) / (2.0 * s) } else { (f(x + s) - 2.0 * fx + f(x - s)) / (s * s) }
+    };
+    let ntab = 10usize;
+    let con2 = 1.4 * 1.4;
+    let a = List::filled(ntab * ntab, 0.0);
+    a[0] = d(hh);
+    let err = f64::INFINITY;
+    let ans = a[0];
+    for i in 1..ntab {
+        hh /= 1.4;
+        a[i] = d(hh);
+        let fac = con2;
+        for j in 1..=i {
+            a[j * ntab + i] = (a[(j - 1) * ntab + i] * fac - a[(j - 1) * ntab + i - 1]) / (fac - 1.0);
+            fac *= con2;
+            let t = (a[j * ntab + i] - a[(j - 1) * ntab + i]).abs().max((a[j * ntab + i] - a[(j - 1) * ntab + i - 1]).abs());
+            if t <= err {
+                err = t;
+                ans = a[j * ntab + i];
+            }
+        }
+        if (a[i * ntab + i] - a[(i - 1) * ntab + i - 1]).abs() >= 2.0 * err { break; }
+    }
+    if !ans.is_finite() { throw InterpError::NotFinite { what: f"f near {x} (the estimate is {ans})" }; }
+    Estimate { value: ans, error: err }
+}

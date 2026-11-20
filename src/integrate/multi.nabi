@@ -1,0 +1,98 @@
+// Double and triple integrals as nested adaptive integrals: each outer
+// point integrates the inner variable with `quad`.
+
+use pkg::InterpError;
+use pkg::integrate::adaptive::{Quad, quad};
+use core::range::Range;
+
+/// The integral of `f(x, y)` over `x` in `rx` and `y` in `ry(x)`, inner
+/// limits as a function of `x`. See `dblquad`.
+///
+/// ```nabi
+/// use core::range::Range;
+///
+/// // The triangle 0 <= y <= x <= 1: area 1/2.
+/// let q = try interpolate::dblquad_over(|x: f64, y: f64| -> f64 { 1.0 }, 0.0..1.0, |x: f64| -> Range<f64> { 0.0..x });
+/// assert((q.value - 0.5).abs() < 1e-14);
+/// ```
+pub fn dblquad_over(f: fn(f64, f64) -> f64, rx: Range<f64>, ry: fn(f64) -> Range<f64>, epsabs: f64 = 1.49e-8, epsrel: f64 = 1.49e-8) throws (InterpError) -> Quad {
+    // Closures cannot throw out of `quad`'s integrand: the first inner
+    // failure is kept and rethrown.
+    let fails: List<InterpError> = [];
+    let stats: List<f64> = [0.0, 0.0];
+    let inner = |x: f64| -> f64 {
+        if fails.len() > 0 { return 0.0; }
+        let g = |y: f64| -> f64 { f(x, y) };
+        try {
+            let q = try quad(g, ry(x), epsabs, epsrel);
+            stats[0] += q.evals as f64;
+            stats[1] = stats[1].max(q.error);
+            q.value
+        } catch e: InterpError {
+            fails.push(e);
+            0.0
+        }
+    };
+    let q = try quad(inner, rx, epsabs, epsrel);
+    if fails.len() > 0 { throw fails[0]; }
+    let w = (rx.end - rx.start).abs();
+    let ie = if w.is_finite() { stats[1] * w } else { stats[1] };
+    Quad { value: q.value, error: q.error + ie, evals: stats[0] as usize, intervals: q.intervals }
+}
+
+/// The integral of `f(x, y)` over the rectangle `rx` x `ry` (ends may
+/// be infinite), `x` outer: `quad` over `x` of `quad` over `y`. The
+/// error adds the outer estimate and the largest inner one times the
+/// width of `rx`; `evals` counts calls of `f`.
+///
+/// ```nabi
+/// let q = try interpolate::dblquad(|x: f64, y: f64| -> f64 { x * y * y }, 0.0..2.0, 0.0..1.0);
+/// assert((q.value - 2.0 / 3.0).abs() < 1e-14);
+/// ```
+pub fn dblquad(f: fn(f64, f64) -> f64, rx: Range<f64>, ry: Range<f64>, epsabs: f64 = 1.49e-8, epsrel: f64 = 1.49e-8) throws (InterpError) -> Quad {
+    try dblquad_over(f, rx, |_x: f64| -> Range<f64> { ry }, epsabs, epsrel)
+}
+
+/// The integral of `f(x, y, z)` over `x` in `rx`, `y` in `ry(x)` and
+/// `z` in `rz(x, y)`. See `tplquad`.
+///
+/// ```nabi
+/// use core::range::Range;
+///
+/// // The unit simplex x, y, z >= 0, x + y + z <= 1: volume 1/6.
+/// let q = try interpolate::tplquad_over(|x: f64, y: f64, z: f64| -> f64 { 1.0 }, 0.0..1.0,
+///     |x: f64| -> Range<f64> { 0.0..1.0 - x }, |x: f64, y: f64| -> Range<f64> { 0.0..1.0 - x - y });
+/// assert((q.value - 1.0 / 6.0).abs() < 1e-13);
+/// ```
+pub fn tplquad_over(f: fn(f64, f64, f64) -> f64, rx: Range<f64>, ry: fn(f64) -> Range<f64>, rz: fn(f64, f64) -> Range<f64>, epsabs: f64 = 1.49e-8, epsrel: f64 = 1.49e-8) throws (InterpError) -> Quad {
+    let fails: List<InterpError> = [];
+    let stats: List<f64> = [0.0, 0.0];
+    let inner = |x: f64| -> f64 {
+        if fails.len() > 0 { return 0.0; }
+        try {
+            let q = try dblquad_over(|y: f64, z: f64| -> f64 { f(x, y, z) }, ry(x), |y: f64| -> Range<f64> { rz(x, y) }, epsabs, epsrel);
+            stats[0] += q.evals as f64;
+            stats[1] = stats[1].max(q.error);
+            q.value
+        } catch e: InterpError {
+            fails.push(e);
+            0.0
+        }
+    };
+    let q = try quad(inner, rx, epsabs, epsrel);
+    if fails.len() > 0 { throw fails[0]; }
+    let w = (rx.end - rx.start).abs();
+    let ie = if w.is_finite() { stats[1] * w } else { stats[1] };
+    Quad { value: q.value, error: q.error + ie, evals: stats[0] as usize, intervals: q.intervals }
+}
+
+/// The integral of `f(x, y, z)` over the box `rx` x `ry` x `rz`, nested
+/// as `dblquad`.
+///
+/// ```nabi
+/// let q = try interpolate::tplquad(|x: f64, y: f64, z: f64| -> f64 { x + y + z }, 0.0..1.0, 0.0..1.0, 0.0..1.0);
+/// assert((q.value - 1.5).abs() < 1e-13);
+/// ```
+pub fn tplquad(f: fn(f64, f64, f64) -> f64, rx: Range<f64>, ry: Range<f64>, rz: Range<f64>, epsabs: f64 = 1.49e-8, epsrel: f64 = 1.49e-8) throws (InterpError) -> Quad {
+    try tplquad_over(f, rx, |_x: f64| -> Range<f64> { ry }, |_x: f64, _y: f64| -> Range<f64> { rz }, epsabs, epsrel)
+}
