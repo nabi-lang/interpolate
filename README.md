@@ -173,7 +173,7 @@ docs give its accuracy and cost.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/interpolate/latest/docs
+https://docs.nabi-lang.org/packages/interpolate/latest
 
 ## License
 
